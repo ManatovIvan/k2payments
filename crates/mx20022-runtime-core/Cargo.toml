@@ -10,3 +10,4 @@ serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+mx20022-metrics = { path = "../mx20022-metrics" }

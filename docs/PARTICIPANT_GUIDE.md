@@ -32,6 +32,25 @@ name = "business-rule-validator"
 config = { scheme = "fednow" }
 
 [[pipeline.participants]]
+name = "duplicate-checker"
+config = { keys = ["message_id", "uetr"] }
+
+[[pipeline.participants]]
+name = "routing-engine"
+config = { default_route = "core-out", rules = [
+  { message_type = "pacs.008", currency = "USD", destination = "fednow-out" },
+  { message_type = "pacs.008", currency = "EUR", destination = "sepa-out" }
+] }
+
+[[pipeline.participants]]
+name = "rate-limiter"
+config = { rate_per_second = 500, burst = 1000, scope = "source_channel" }
+
+[[pipeline.participants]]
+name = "circuit-breaker"
+config = { failure_threshold = 5, open_ms = 30000 }
+
+[[pipeline.participants]]
 name = "message-logger"
 config = { tag = "demo" }
 
@@ -46,7 +65,16 @@ config = { auto_pacs002 = true }
 - `schema-validator`: validates inbound XML by parsing and running `mx20022` typed constraints (requires ISO 20022 namespace).
 - `business-rule-validator`: applies baseline ISO 20022 rule checks (currency/amount guardrails).
 - `business-rule-validator` supports an optional `scheme` config (`fednow`, `sepa`, `cbpr`).
+- `fednow-rule-validator`: fixed FedNow scheme validation.
+- `sepa-rule-validator`: fixed SEPA scheme validation.
+- `cbpr-rule-validator`: fixed CBPR+ scheme validation.
+- `duplicate-checker`: Store-backed duplicate detection by `keys` (`message_id`, `end_to_end_id`, `uetr`).
+- `routing-engine`: context route selection (`routing.destination`) using top-down `rules`; first match wins.
+- `rate-limiter`: token-bucket prepare gating (`rate_per_second`, `burst`, `scope`).
+- `circuit-breaker`: opens after `failure_threshold` aborts; blocks prepare for `open_ms`.
 - `status-response-builder`: builds a `pacs.002` response and stores it in the context.
+- `acknowledgement-builder`: builds technical `head.001`-style acknowledgement payloads on commit.
+- `error-response-builder`: builds rejection payloads on abort with reason mapping from context.
 
 ## Context usage
 

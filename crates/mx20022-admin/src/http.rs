@@ -1,3 +1,4 @@
+use crate::auth::{authorize_request, AdminResource, AuthConfig, AuthError};
 use crate::controller::{AdminController, AdminControllerError};
 use crate::middleware::{MiddlewareStage, DEFAULT_MIDDLEWARE_CHAIN};
 use crate::routes::HttpMethod;
@@ -7,6 +8,7 @@ pub struct HttpRequest {
     pub method: HttpMethod,
     pub path: String,
     pub bearer_token: Option<String>,
+    pub mtls_subject: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -16,7 +18,15 @@ pub struct HttpResponse {
 }
 
 pub async fn dispatch(controller: &dyn AdminController, request: HttpRequest) -> HttpResponse {
-    if let Err(response) = run_middleware(&request) {
+    dispatch_with_auth(controller, request, &AuthConfig::default()).await
+}
+
+pub async fn dispatch_with_auth(
+    controller: &dyn AdminController,
+    request: HttpRequest,
+    auth: &AuthConfig,
+) -> HttpResponse {
+    if let Err(response) = run_middleware(&request, auth) {
         return response;
     }
 
@@ -42,6 +52,13 @@ pub async fn dispatch(controller: &dyn AdminController, request: HttpRequest) ->
             },
             Err(error) => map_controller_error(error),
         },
+        (HttpMethod::Post, "/reload") => match controller.reload_config().await {
+            Ok(dto) => HttpResponse {
+                status: 200,
+                body: serde_json::to_string(&dto).unwrap_or_else(|_| "{}".to_string()),
+            },
+            Err(error) => map_controller_error(error),
+        },
         (HttpMethod::Get, path) if path.starts_with("/tx/") => {
             let tx_id = path.trim_start_matches("/tx/");
             match controller.get_transaction(tx_id).await {
@@ -59,27 +76,33 @@ pub async fn dispatch(controller: &dyn AdminController, request: HttpRequest) ->
     }
 }
 
-fn run_middleware(request: &HttpRequest) -> Result<(), HttpResponse> {
+fn run_middleware(request: &HttpRequest, auth: &AuthConfig) -> Result<(), HttpResponse> {
     for stage in DEFAULT_MIDDLEWARE_CHAIN {
         match stage {
             MiddlewareStage::Authentication => {
-                if request.path != "/health" && request.bearer_token.is_none() {
-                    return Err(HttpResponse {
-                        status: 401,
-                        body: "{\"error\":\"missing bearer token\"}".to_string(),
-                    });
+                if request.path != "/health" && request.path != "/metrics" {
+                    let resource = if request.path == "/ready" {
+                        AdminResource::Ready
+                    } else if request.path == "/status" {
+                        AdminResource::Status
+                    } else if request.path == "/reload" {
+                        AdminResource::Reload
+                    } else if request.path.starts_with("/tx/") {
+                        AdminResource::Transaction
+                    } else {
+                        AdminResource::Status
+                    };
+                    let bearer = request.bearer_token.as_ref().map(|v| format!("Bearer {v}"));
+                    authorize_request(
+                        auth,
+                        resource,
+                        bearer.as_deref(),
+                        request.mtls_subject.as_deref(),
+                    )
+                    .map_err(map_auth_error)?;
                 }
             }
-            MiddlewareStage::Authorization => {
-                if request.path.starts_with("/tx/")
-                    && request.bearer_token.as_deref() == Some("readonly")
-                {
-                    return Err(HttpResponse {
-                        status: 403,
-                        body: "{\"error\":\"forbidden\"}".to_string(),
-                    });
-                }
-            }
+            MiddlewareStage::Authorization => {}
             MiddlewareStage::RateLimit => {}
             MiddlewareStage::Validation => {
                 if request.path.trim().is_empty() {
@@ -95,6 +118,17 @@ fn run_middleware(request: &HttpRequest) -> Result<(), HttpResponse> {
     }
 
     Ok(())
+}
+
+fn map_auth_error(error: AuthError) -> HttpResponse {
+    let status = match error {
+        AuthError::MissingBearer | AuthError::InvalidBearer | AuthError::MissingMtlsSubject => 401,
+        AuthError::Forbidden | AuthError::UntrustedMtlsSubject => 403,
+    };
+    HttpResponse {
+        status,
+        body: format!("{{\"error\":\"{}\"}}", error),
+    }
 }
 
 fn map_controller_error(error: AdminControllerError) -> HttpResponse {
@@ -117,7 +151,7 @@ fn map_controller_error(error: AdminControllerError) -> HttpResponse {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::sync::Arc;
+    use std::sync::{Arc, RwLock};
     use std::time::SystemTime;
 
     use mx20022_store::{Store, TransactionRecord};
@@ -125,7 +159,7 @@ mod tests {
 
     use crate::http::{dispatch, HttpRequest};
     use crate::routes::HttpMethod;
-    use crate::service::{RuntimeStatusSnapshot, StoreBackedAdminController};
+    use crate::service::{ReloadStatus, RuntimeStatusSnapshot, StoreBackedAdminController};
 
     #[tokio::test]
     async fn dispatches_status_and_tx_routes() {
@@ -153,6 +187,12 @@ mod tests {
                 pipelines: vec!["demo".to_string()],
                 channels: vec!["http".to_string()],
                 store: "sqlite".to_string(),
+                started_at: SystemTime::now(),
+                reload_status: Arc::new(RwLock::new(ReloadStatus {
+                    config_version: "cfg-v1".to_string(),
+                    last_result: None,
+                    last_reloaded_at: None,
+                })),
             },
         );
 
@@ -162,6 +202,7 @@ mod tests {
                 method: HttpMethod::Get,
                 path: "/status".to_string(),
                 bearer_token: Some("admin".to_string()),
+                mtls_subject: None,
             },
         )
         .await;
@@ -173,6 +214,7 @@ mod tests {
                 method: HttpMethod::Get,
                 path: "/tx/TX-E1".to_string(),
                 bearer_token: Some("admin".to_string()),
+                mtls_subject: None,
             },
         )
         .await;

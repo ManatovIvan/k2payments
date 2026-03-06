@@ -50,8 +50,9 @@ impl TransactionManager {
         let started_at = SystemTime::now();
         let mut results = Vec::with_capacity(self.participants.len());
         let mut prepared_indexes = Vec::new();
+        let pipeline = ctx.pipeline().to_string();
 
-        ctx.transition_to(LifecycleState::Preparing)?;
+        transition_with_metrics(ctx, LifecycleState::Preparing)?;
 
         for (index, participant) in self.participants.iter().enumerate() {
             let tick = SystemTime::now();
@@ -60,6 +61,12 @@ impl TransactionManager {
 
             match prepare_result {
                 Ok(Action::Prepared) => {
+                    mx20022_metrics::record_participant_duration(
+                        &pipeline,
+                        participant.name(),
+                        "prepared",
+                        duration.as_secs_f64(),
+                    );
                     prepared_indexes.push(index);
                     results.push(ParticipantResult {
                         participant: participant.name().to_string(),
@@ -69,6 +76,12 @@ impl TransactionManager {
                     });
                 }
                 Ok(Action::Aborted) => {
+                    mx20022_metrics::record_participant_duration(
+                        &pipeline,
+                        participant.name(),
+                        "aborted",
+                        duration.as_secs_f64(),
+                    );
                     results.push(ParticipantResult {
                         participant: participant.name().to_string(),
                         action: Some(Action::Aborted),
@@ -89,6 +102,17 @@ impl TransactionManager {
                     });
                 }
                 Err(error) => {
+                    mx20022_metrics::record_participant_duration(
+                        &pipeline,
+                        participant.name(),
+                        "prepare_error",
+                        duration.as_secs_f64(),
+                    );
+                    mx20022_metrics::record_participant_error(
+                        &pipeline,
+                        participant.name(),
+                        "prepare",
+                    );
                     results.push(ParticipantResult {
                         participant: participant.name().to_string(),
                         action: None,
@@ -111,16 +135,23 @@ impl TransactionManager {
             }
         }
 
-        ctx.transition_to(LifecycleState::Prepared)?;
-        ctx.transition_to(LifecycleState::Committing)?;
+        transition_with_metrics(ctx, LifecycleState::Prepared)?;
+        transition_with_metrics(ctx, LifecycleState::Committing)?;
 
         for index in &prepared_indexes {
             let participant = &self.participants[*index];
             let tick = SystemTime::now();
             let result = participant.commit(ctx).await;
             let duration = elapsed(tick);
+            mx20022_metrics::record_participant_duration(
+                &pipeline,
+                participant.name(),
+                "commit",
+                duration.as_secs_f64(),
+            );
 
             if let Err(error) = result {
+                mx20022_metrics::record_participant_error(&pipeline, participant.name(), "commit");
                 let error_message = error.to_string();
                 if let Some(existing) = results
                     .iter_mut()
@@ -136,7 +167,7 @@ impl TransactionManager {
                     });
                 }
 
-                ctx.transition_to(LifecycleState::Poison)?;
+                transition_with_metrics(ctx, LifecycleState::Poison)?;
 
                 return Ok(TransactionReport {
                     tx_id: ctx.transaction_id().to_string(),
@@ -148,7 +179,7 @@ impl TransactionManager {
             }
         }
 
-        ctx.transition_to(LifecycleState::Committed)?;
+        transition_with_metrics(ctx, LifecycleState::Committed)?;
 
         Ok(TransactionReport {
             tx_id: ctx.transaction_id().to_string(),
@@ -165,7 +196,8 @@ impl TransactionManager {
         prepared_indexes: &[usize],
         results: &mut Vec<ParticipantResult>,
     ) -> Outcome {
-        if let Err(e) = ctx.transition_to(LifecycleState::Aborting) {
+        let pipeline = ctx.pipeline().to_string();
+        if let Err(e) = transition_with_metrics(ctx, LifecycleState::Aborting) {
             warn!("failed to transition to Aborting, poisoning transaction: {e}");
             return Outcome::Poison;
         }
@@ -178,6 +210,12 @@ impl TransactionManager {
 
             match abort_result {
                 Ok(()) => {
+                    mx20022_metrics::record_participant_duration(
+                        &pipeline,
+                        participant.name(),
+                        "abort",
+                        duration.as_secs_f64(),
+                    );
                     results.push(ParticipantResult {
                         participant: participant.name().to_string(),
                         action: Some(Action::Aborted),
@@ -186,13 +224,24 @@ impl TransactionManager {
                     });
                 }
                 Err(error) => {
+                    mx20022_metrics::record_participant_duration(
+                        &pipeline,
+                        participant.name(),
+                        "abort_error",
+                        duration.as_secs_f64(),
+                    );
+                    mx20022_metrics::record_participant_error(
+                        &pipeline,
+                        participant.name(),
+                        "abort",
+                    );
                     results.push(ParticipantResult {
                         participant: participant.name().to_string(),
                         action: Some(Action::Aborted),
                         duration,
                         error: Some(error.to_string()),
                     });
-                    if let Err(e) = ctx.transition_to(LifecycleState::Poison) {
+                    if let Err(e) = transition_with_metrics(ctx, LifecycleState::Poison) {
                         warn!("failed to transition to Poison after abort error: {e}");
                     }
                     return Outcome::Poison;
@@ -200,7 +249,7 @@ impl TransactionManager {
             }
         }
 
-        if let Err(e) = ctx.transition_to(LifecycleState::Aborted) {
+        if let Err(e) = transition_with_metrics(ctx, LifecycleState::Aborted) {
             warn!("failed to transition to Aborted, poisoning transaction: {e}");
             return Outcome::Poison;
         }
@@ -211,6 +260,21 @@ impl TransactionManager {
 
 fn elapsed(start: SystemTime) -> Duration {
     start.elapsed().unwrap_or_else(|_| Duration::from_secs(0))
+}
+
+fn transition_with_metrics(
+    ctx: &mut Context,
+    next: LifecycleState,
+) -> Result<(), crate::context::ContextError> {
+    let from = ctx.state();
+    let pipeline = ctx.pipeline().to_string();
+    ctx.transition_to(next)?;
+    mx20022_metrics::record_state_transition(
+        &pipeline,
+        format!("{from:?}").as_str(),
+        format!("{next:?}").as_str(),
+    );
+    Ok(())
 }
 
 #[derive(Debug, thiserror::Error)]

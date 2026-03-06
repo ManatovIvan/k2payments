@@ -17,6 +17,15 @@ message StatusResponse {
   repeated string pipelines = 2;
   repeated string channels = 3;
   string store = 4;
+  string uptime_ms = 5;
+  bool store_ok = 6;
+  string store_details = 7;
+  uint64 in_flight_count = 8;
+  uint64 pending_correlation_count = 9;
+  uint64 dead_letter_count = 10;
+  string config_version = 11;
+  string last_reload_result = 12;
+  string last_reload_at = 13;
 }
 
 message GetTransactionRequest {
@@ -32,9 +41,15 @@ message TransactionResponse {
   string completed_at = 6;
 }
 
+message ReloadResponse {
+  bool reloaded = 1;
+  string details = 2;
+}
+
 service AdminService {
   rpc GetHealth(google.protobuf.Empty) returns (HealthResponse);
   rpc GetReady(google.protobuf.Empty) returns (ReadyResponse);
   rpc GetStatus(google.protobuf.Empty) returns (StatusResponse);
   rpc GetTransaction(GetTransactionRequest) returns (TransactionResponse);
+  rpc Reload(google.protobuf.Empty) returns (ReloadResponse);
 }

@@ -6,7 +6,7 @@ use mx20022_store::{
     ContextEntry, DeadLetter, DeadLetterQuery, ExpUpdate, Expectation, Outcome, QueryResult, Store,
     StoreError, StoreHealth, StoreQuery, TransactionRecord, TransactionUpdate,
 };
-use sqlx::{Pool, Postgres, Row};
+use sqlx::{Pool, Postgres, QueryBuilder, Row};
 
 const INIT_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS transactions (
@@ -272,6 +272,38 @@ impl Store for PostgresStore {
         Ok(())
     }
 
+    async fn list_context_entries(&self, tx_id: &str) -> Result<Vec<ContextEntry>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT tx_id, key, writer, written_at FROM context_mutations WHERE tx_id = $1 ORDER BY written_at ASC",
+        )
+        .bind(tx_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StoreError::new(format!("list_context_entries failed: {e}")))?;
+
+        let mut entries = Vec::new();
+        for row in rows {
+            entries.push(ContextEntry {
+                tx_id: row
+                    .try_get("tx_id")
+                    .map_err(|e| StoreError::new(format!("context tx_id map failed: {e}")))?,
+                key: row
+                    .try_get("key")
+                    .map_err(|e| StoreError::new(format!("context key map failed: {e}")))?,
+                writer: row
+                    .try_get("writer")
+                    .map_err(|e| StoreError::new(format!("context writer map failed: {e}")))?,
+                written_at: decode_time(
+                    row.try_get("written_at").map_err(|e| {
+                        StoreError::new(format!("context written_at map failed: {e}"))
+                    })?,
+                ),
+            });
+        }
+
+        Ok(entries)
+    }
+
     async fn find_by_id(&self, tx_id: &str) -> Result<Option<TransactionRecord>, StoreError> {
         let row = sqlx::query(
             "SELECT tx_id, pipeline, source_channel, message_type, raw_message, state, received_at, completed_at, key_fields_json
@@ -334,48 +366,56 @@ impl Store for PostgresStore {
     }
 
     async fn query(&self, filter: StoreQuery) -> Result<QueryResult, StoreError> {
-        let rows = sqlx::query(
-            "SELECT tx_id, pipeline, source_channel, message_type, raw_message, state, received_at, completed_at, key_fields_json
-             FROM transactions ORDER BY received_at DESC",
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| StoreError::new(format!("query failed: {e}")))?;
+        let mut qb = QueryBuilder::<Postgres>::new(
+            "SELECT tx_id, pipeline, source_channel, message_type, raw_message, state, received_at, completed_at, key_fields_json FROM transactions",
+        );
+        let mut has_where = false;
+
+        if let Some(pipeline) = &filter.pipeline {
+            qb.push(if has_where { " AND " } else { " WHERE " });
+            qb.push("pipeline = ");
+            qb.push_bind(pipeline);
+            has_where = true;
+        }
+        if let Some(message_type) = &filter.message_type {
+            qb.push(if has_where { " AND " } else { " WHERE " });
+            qb.push("message_type = ");
+            qb.push_bind(message_type);
+            has_where = true;
+        }
+        if let Some(state) = &filter.state {
+            qb.push(if has_where { " AND " } else { " WHERE " });
+            qb.push("state = ");
+            qb.push_bind(state);
+            has_where = true;
+        }
+        if let Some(since) = filter.since {
+            qb.push(if has_where { " AND " } else { " WHERE " });
+            qb.push("received_at >= ");
+            qb.push_bind(encode_time(since));
+            has_where = true;
+        }
+        if let Some(until) = filter.until {
+            qb.push(if has_where { " AND " } else { " WHERE " });
+            qb.push("received_at <= ");
+            qb.push_bind(encode_time(until));
+        }
+
+        qb.push(" ORDER BY received_at DESC");
+        if let Some(limit) = filter.limit {
+            qb.push(" LIMIT ");
+            qb.push_bind(i64::try_from(limit).unwrap_or(i64::MAX));
+        }
+
+        let rows = qb
+            .build()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::new(format!("query failed: {e}")))?;
 
         let mut records = Vec::new();
         for row in rows {
-            let record = map_transaction_row(row)?;
-            if let Some(ref pipeline) = filter.pipeline {
-                if &record.pipeline != pipeline {
-                    continue;
-                }
-            }
-            if let Some(ref message_type) = filter.message_type {
-                if &record.message_type != message_type {
-                    continue;
-                }
-            }
-            if let Some(ref state) = filter.state {
-                if &record.state != state {
-                    continue;
-                }
-            }
-            if let Some(since) = filter.since {
-                if record.received_at < since {
-                    continue;
-                }
-            }
-            if let Some(until) = filter.until {
-                if record.received_at > until {
-                    continue;
-                }
-            }
-            records.push(record);
-            if let Some(limit) = filter.limit {
-                if records.len() >= limit {
-                    break;
-                }
-            }
+            records.push(map_transaction_row(row)?);
         }
 
         Ok(QueryResult {
@@ -537,13 +577,13 @@ impl Store for PostgresStore {
     }
 
     async fn replay_dead_letter(&self, id: &str) -> Result<(), StoreError> {
-        let exists = sqlx::query("SELECT id FROM dead_letters WHERE id = $1")
+        let result = sqlx::query("DELETE FROM dead_letters WHERE id = $1")
             .bind(id)
-            .fetch_optional(&self.pool)
+            .execute(&self.pool)
             .await
             .map_err(|e| StoreError::new(format!("replay_dead_letter failed: {e}")))?;
 
-        if exists.is_none() {
+        if result.rows_affected() == 0 {
             return Err(StoreError::new(format!("dead letter not found: {id}")));
         }
 

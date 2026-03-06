@@ -1,5 +1,7 @@
 use async_trait::async_trait;
 
+pub mod auth;
+
 #[derive(Debug, Clone)]
 pub struct InboundMessage {
     pub raw: String,

@@ -30,6 +30,11 @@ pub const ADMIN_ROUTES: &[Route] = &[
         handler: "get_status",
     },
     Route {
+        method: HttpMethod::Post,
+        path: "/reload",
+        handler: "reload_config",
+    },
+    Route {
         method: HttpMethod::Get,
         path: "/tx/{txId}",
         handler: "get_transaction",

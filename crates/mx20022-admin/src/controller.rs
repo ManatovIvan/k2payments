@@ -1,6 +1,9 @@
 use async_trait::async_trait;
 
-use crate::dto::{HealthResponseDto, ReadyResponseDto, StatusResponseDto, TransactionResponseDto};
+use crate::dto::{
+    HealthResponseDto, ReadyResponseDto, ReloadResponseDto, StatusResponseDto,
+    TransactionResponseDto,
+};
 
 #[async_trait]
 pub trait AdminController: Send + Sync {
@@ -11,6 +14,7 @@ pub trait AdminController: Send + Sync {
         &self,
         tx_id: &str,
     ) -> Result<TransactionResponseDto, AdminControllerError>;
+    async fn reload_config(&self) -> Result<ReloadResponseDto, AdminControllerError>;
 }
 
 #[derive(Debug, thiserror::Error)]

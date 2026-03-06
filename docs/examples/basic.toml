@@ -4,6 +4,22 @@ instance_id = "local-01"
 log_level = "info"
 metrics_bind = "0.0.0.0:9100"
 admin_bind = "127.0.0.1:9090"
+participant_reload_poll_ms = 2000
+recover_incomplete_on_startup = true
+recovery_startup_limit = 500
+
+[runtime.admin_auth]
+mode = "jwt_hs256"
+jwt_hs256_secret = "replace-me"
+jwt_issuer = "mxruntime"
+jwt_audience = "mxruntime-admin"
+ready_roles = ["admin.read", "admin"]
+status_roles = ["admin.read", "admin"]
+tx_roles = ["admin.tx.read", "admin"]
+reload_roles = ["admin.write", "admin"]
+require_mtls_subject = true
+mtls_subject_header = "x-client-cert-subject"
+mtls_allowed_subjects = ["CN=mxctl,O=example"]
 
 [store]
 backend = "sqlite"
@@ -14,6 +30,14 @@ type = "http"
 mode = "server"
 bind = "0.0.0.0:8443"
 content_type = "application/xml"
+auth_mode = "jwt_hs256"
+auth_jwt_hs256_secret = "replace-me"
+auth_jwt_issuer = "mxruntime"
+auth_jwt_audience = "mxruntime-channel"
+auth_required_roles = ["channel.ingress"]
+auth_require_mtls_subject = true
+auth_mtls_subject_header = "x-client-cert-subject"
+auth_mtls_allowed_subjects = ["CN=inbound-gateway,O=example"]
 
 [[pipeline]]
 name = "demo"
@@ -21,5 +45,13 @@ channel_in = "http-in"
 message_types = ["pacs.008"]
 max_concurrent = 100
 participants = [
+  { name = "duplicate-checker", config = { keys = ["message_id", "uetr"] } },
+  { name = "rate-limiter", config = { rate_per_second = 500, burst = 1000, scope = "source_channel" } },
+  { name = "schema-validator", config = {} },
+  { name = "fednow-rule-validator", config = {} },
+  { name = "routing-engine", config = { default_route = "fednow-out", rules = [
+    { message_type = "pacs.008", currency = "USD", destination = "fednow-out" }
+  ] } },
   { name = "message-logger", config = {} },
+  { name = "status-response-builder", config = { auto_pacs002 = true } },
 ]

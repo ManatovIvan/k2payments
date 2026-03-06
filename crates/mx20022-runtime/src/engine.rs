@@ -9,6 +9,7 @@ use mx20022_channel_http::{HttpInboundChannel, HttpInboundConfig};
 use mx20022_channel_kafka::{KafkaInboundChannel, KafkaInboundConfig};
 use mx20022_channel_nats::{NatsInboundChannel, NatsInboundConfig};
 use mx20022_channel_tcp::{TcpFraming, TcpInboundChannel, TcpInboundConfig};
+use mx20022_channels::auth::{InboundAuthConfig, InboundAuthMode};
 use mx20022_channels::{InboundChannel, InboundMessage};
 use mx20022_config::{ChannelSection, RuntimeConfig};
 use tokio::sync::{mpsc, Semaphore};
@@ -41,6 +42,7 @@ pub async fn run_pipelines(app: Arc<RuntimeApp>, config: RuntimeConfig) -> Resul
                     name: channel_name.clone(),
                     bind: extract_bind(channel_cfg)?,
                     content_type: "application/xml".to_string(),
+                    auth: extract_inbound_auth(channel_cfg)?,
                 })),
                 ("file", "watch") => Arc::new(FileInboundChannel::new(
                     channel_name.clone(),
@@ -55,6 +57,7 @@ pub async fn run_pipelines(app: Arc<RuntimeApp>, config: RuntimeConfig) -> Resul
                 ("grpc", "server") => Arc::new(GrpcInboundChannel::new(GrpcInboundConfig {
                     name: channel_name.clone(),
                     bind: extract_bind(channel_cfg)?,
+                    auth: extract_inbound_auth(channel_cfg)?,
                 })),
                 ("tcp", "server") => Arc::new(TcpInboundChannel::new(TcpInboundConfig {
                     name: channel_name.clone(),
@@ -255,6 +258,92 @@ fn infer_message_type(msg: &InboundMessage, fallback: &str) -> String {
     }
 
     fallback.to_string()
+}
+
+fn extract_inbound_auth(channel_cfg: &ChannelSection) -> Result<InboundAuthConfig, EngineError> {
+    let mode = extract_optional(channel_cfg, "auth_mode").unwrap_or_else(|| "disabled".to_string());
+    let mode = match mode.as_str() {
+        "disabled" => InboundAuthMode::Disabled,
+        "static_bearer" => InboundAuthMode::StaticBearer,
+        "jwt_hs256" => InboundAuthMode::JwtHs256,
+        other => {
+            return Err(EngineError::Config(format!(
+                "invalid auth_mode `{other}` for channel `{}`",
+                channel_cfg.channel_type
+            )))
+        }
+    };
+
+    let required_roles = channel_cfg
+        .extra
+        .get("auth_required_roles")
+        .and_then(|value| value.as_array())
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|item| item.as_str().map(ToString::to_string))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let auth = InboundAuthConfig {
+        mode,
+        bearer_token: extract_optional(channel_cfg, "auth_bearer_token"),
+        jwt_hs256_secret: extract_optional(channel_cfg, "auth_jwt_hs256_secret"),
+        jwt_issuer: extract_optional(channel_cfg, "auth_jwt_issuer"),
+        jwt_audience: extract_optional(channel_cfg, "auth_jwt_audience"),
+        required_roles,
+        require_mtls_subject: channel_cfg
+            .extra
+            .get("auth_require_mtls_subject")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false),
+        mtls_subject_header: extract_optional(channel_cfg, "auth_mtls_subject_header")
+            .unwrap_or_else(|| "x-client-cert-subject".to_string()),
+        mtls_allowed_subjects: channel_cfg
+            .extra
+            .get("auth_mtls_allowed_subjects")
+            .and_then(|value| value.as_array())
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(|item| item.as_str().map(ToString::to_string))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default(),
+    };
+
+    match auth.mode {
+        InboundAuthMode::Disabled => Ok(auth),
+        InboundAuthMode::StaticBearer => {
+            if auth
+                .bearer_token
+                .as_ref()
+                .map(|value| !value.trim().is_empty())
+                .unwrap_or(false)
+            {
+                Ok(auth)
+            } else {
+                Err(EngineError::Config(
+                    "channel auth_mode=static_bearer requires auth_bearer_token".to_string(),
+                ))
+            }
+        }
+        InboundAuthMode::JwtHs256 => {
+            if auth
+                .jwt_hs256_secret
+                .as_ref()
+                .map(|value| !value.trim().is_empty())
+                .unwrap_or(false)
+            {
+                Ok(auth)
+            } else {
+                Err(EngineError::Config(
+                    "channel auth_mode=jwt_hs256 requires auth_jwt_hs256_secret".to_string(),
+                ))
+            }
+        }
+    }
 }
 
 fn next_tx_id() -> String {

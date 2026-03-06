@@ -104,6 +104,7 @@ pub trait Store: Send + Sync {
         tx_id: &str,
         entry: ContextEntry,
     ) -> Result<(), StoreError>;
+    async fn list_context_entries(&self, tx_id: &str) -> Result<Vec<ContextEntry>, StoreError>;
 
     async fn find_by_id(&self, tx_id: &str) -> Result<Option<TransactionRecord>, StoreError>;
     async fn find_by_message_id(&self, msg_id: &str) -> Result<Vec<TransactionRecord>, StoreError>;
