@@ -30,6 +30,7 @@ All notable changes to this project will be documented in this file.
 - Added `mxctl deadletter list|show|replay` commands for dead-letter operations via configured store backend.
 - Added `mxctl tx context` command backed by a new store API for persisted context mutation history.
 - Runtime now supports participant-config-only reload with strict topology-change rejection (pipeline/participant structure changes require restart).
+- gRPC/admin protobuf build scripts now use vendored `protoc` binaries for CI portability.
 
 ### Tested
 - `cargo fmt --all`
