@@ -3,7 +3,7 @@
   "dockerComposeFile": "docker-compose.yml",
   "service": "app",
   "workspaceFolder": "/workspaces/k2payments",
-  "forwardPorts": [8443, 9090, 9091, 9100, 5432, 5672, 4222, 9092, 15672],
+  "forwardPorts": [8443, 9090, 9091, 9100, 15432, 15672, 14222, 19092, 25672],
   "postCreateCommand": "cargo fetch",
   "customizations": {
     "vscode": {
