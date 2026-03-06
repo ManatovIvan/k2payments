@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use mx20022_channels::auth::{authorize_inbound, InboundAuthConfig, InboundAuthContext};
 use mx20022_channels::{
     ChannelError, ChannelHealth, DeliveryReceipt, InboundChannel, InboundMessage, OutboundChannel,
     OutboundMessage,
@@ -20,6 +21,7 @@ pub mod proto {
 pub struct GrpcInboundConfig {
     pub name: String,
     pub bind: String,
+    pub auth: InboundAuthConfig,
 }
 
 #[derive(Clone)]
@@ -47,6 +49,7 @@ impl GrpcInboundChannel {
             sender,
             paused: Arc::clone(&self.paused),
             shutdown: Arc::clone(&self.shutdown),
+            auth: self.config.auth.clone(),
         };
 
         Server::builder()
@@ -64,6 +67,7 @@ struct InboundService {
     sender: mpsc::Sender<InboundMessage>,
     paused: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
+    auth: InboundAuthConfig,
 }
 
 #[tonic::async_trait]
@@ -78,6 +82,29 @@ impl proto::runtime_channel_server::RuntimeChannel for InboundService {
         if self.paused.load(Ordering::Relaxed) {
             return Err(Status::unavailable("channel paused"));
         }
+
+        authorize_inbound(
+            &self.auth,
+            InboundAuthContext {
+                authorization_header: request
+                    .metadata()
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok()),
+                mtls_subject: request
+                    .metadata()
+                    .get(self.auth.mtls_subject_header.as_str())
+                    .and_then(|value| value.to_str().ok()),
+            },
+        )
+        .map_err(|error| {
+            if error.to_string().contains("forbidden")
+                || error.to_string().contains("untrusted mTLS")
+            {
+                Status::permission_denied(error.to_string())
+            } else {
+                Status::unauthenticated(error.to_string())
+            }
+        })?;
 
         let envelope = request.into_inner();
         self.sender
@@ -109,6 +136,7 @@ impl InboundChannel for GrpcInboundChannel {
             sender,
             paused: Arc::clone(&self.paused),
             shutdown: Arc::clone(&self.shutdown),
+            auth: self.config.auth.clone(),
         };
 
         Server::builder()
@@ -249,6 +277,7 @@ mod tests {
         let inbound = GrpcInboundChannel::new(GrpcInboundConfig {
             name: "grpc-in".to_string(),
             bind: local_addr.to_string(),
+            auth: mx20022_channels::auth::InboundAuthConfig::default(),
         });
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let runner = inbound.clone();

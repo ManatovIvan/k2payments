@@ -3,9 +3,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use axum::body::Bytes;
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::routing::post;
 use axum::Router;
+use mx20022_channels::auth::{authorize_inbound, InboundAuthConfig, InboundAuthContext};
 use mx20022_channels::{
     ChannelError, ChannelHealth, DeliveryReceipt, InboundChannel, InboundMessage, OutboundChannel,
     OutboundMessage,
@@ -17,6 +18,7 @@ pub struct HttpInboundConfig {
     pub name: String,
     pub bind: String,
     pub content_type: String,
+    pub auth: InboundAuthConfig,
 }
 
 #[derive(Clone)]
@@ -24,6 +26,7 @@ struct InboundState {
     sender: mpsc::Sender<InboundMessage>,
     content_type: String,
     paused: Arc<RwLock<bool>>,
+    auth: InboundAuthConfig,
 }
 
 pub struct HttpInboundChannel {
@@ -51,6 +54,7 @@ impl InboundChannel for HttpInboundChannel {
             sender,
             content_type: self.config.content_type.clone(),
             paused: Arc::clone(&self.paused),
+            auth: self.config.auth.clone(),
         };
 
         let app = Router::new()
@@ -88,9 +92,34 @@ impl InboundChannel for HttpInboundChannel {
     }
 }
 
-async fn handle_post(State(state): State<InboundState>, body: Bytes) -> (StatusCode, String) {
+async fn handle_post(
+    State(state): State<InboundState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> (StatusCode, String) {
     if *state.paused.read().await {
         return (StatusCode::SERVICE_UNAVAILABLE, String::new());
+    }
+
+    if let Err(error) = authorize_inbound(
+        &state.auth,
+        InboundAuthContext {
+            authorization_header: headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok()),
+            mtls_subject: headers
+                .get(state.auth.mtls_subject_header.as_str())
+                .and_then(|value| value.to_str().ok()),
+        },
+    ) {
+        let code = if error.to_string().contains("forbidden")
+            || error.to_string().contains("untrusted mTLS")
+        {
+            StatusCode::FORBIDDEN
+        } else {
+            StatusCode::UNAUTHORIZED
+        };
+        return (code, String::new());
     }
 
     let payload = String::from_utf8_lossy(&body).to_string();

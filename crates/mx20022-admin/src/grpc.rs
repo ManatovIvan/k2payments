@@ -4,6 +4,7 @@ use std::sync::Arc;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 
+use crate::auth::{authorize_request, AdminResource, AuthConfig, AuthError};
 use crate::controller::{AdminController, AdminControllerError};
 
 pub mod proto {
@@ -13,11 +14,12 @@ pub mod proto {
 #[derive(Clone)]
 pub struct AdminGrpcService {
     controller: Arc<dyn AdminController>,
+    auth: AuthConfig,
 }
 
 impl AdminGrpcService {
-    pub fn new(controller: Arc<dyn AdminController>) -> Self {
-        Self { controller }
+    pub fn new(controller: Arc<dyn AdminController>, auth: AuthConfig) -> Self {
+        Self { controller, auth }
     }
 }
 
@@ -38,8 +40,10 @@ impl proto::admin_service_server::AdminService for AdminGrpcService {
 
     async fn get_ready(
         &self,
-        _request: Request<()>,
+        request: Request<()>,
     ) -> Result<Response<proto::ReadyResponse>, Status> {
+        self.authorize(&request, AdminResource::Ready)
+            .map_err(map_auth_error)?;
         let dto = self
             .controller
             .get_ready()
@@ -54,8 +58,10 @@ impl proto::admin_service_server::AdminService for AdminGrpcService {
 
     async fn get_status(
         &self,
-        _request: Request<()>,
+        request: Request<()>,
     ) -> Result<Response<proto::StatusResponse>, Status> {
+        self.authorize(&request, AdminResource::Status)
+            .map_err(map_auth_error)?;
         let dto = self
             .controller
             .get_status()
@@ -67,6 +73,15 @@ impl proto::admin_service_server::AdminService for AdminGrpcService {
             pipelines: dto.pipelines,
             channels: dto.channels,
             store: dto.store,
+            uptime_ms: dto.uptime_ms,
+            store_ok: dto.store_ok,
+            store_details: dto.store_details.unwrap_or_default(),
+            in_flight_count: dto.in_flight_count as u64,
+            pending_correlation_count: dto.pending_correlation_count as u64,
+            dead_letter_count: dto.dead_letter_count as u64,
+            config_version: dto.config_version,
+            last_reload_result: dto.last_reload_result.unwrap_or_default(),
+            last_reload_at: dto.last_reload_at.unwrap_or_default(),
         }))
     }
 
@@ -74,6 +89,8 @@ impl proto::admin_service_server::AdminService for AdminGrpcService {
         &self,
         request: Request<proto::GetTransactionRequest>,
     ) -> Result<Response<proto::TransactionResponse>, Status> {
+        self.authorize(&request, AdminResource::Transaction)
+            .map_err(map_auth_error)?;
         let tx_id = request.into_inner().tx_id;
         let dto = self
             .controller
@@ -90,16 +107,51 @@ impl proto::admin_service_server::AdminService for AdminGrpcService {
             completed_at: dto.completed_at.unwrap_or_default(),
         }))
     }
+
+    async fn reload(
+        &self,
+        request: Request<()>,
+    ) -> Result<Response<proto::ReloadResponse>, Status> {
+        self.authorize(&request, AdminResource::Reload)
+            .map_err(map_auth_error)?;
+        let dto = self
+            .controller
+            .reload_config()
+            .await
+            .map_err(map_error_to_status)?;
+
+        Ok(Response::new(proto::ReloadResponse {
+            reloaded: dto.reloaded,
+            details: dto.details,
+        }))
+    }
 }
 
-pub async fn serve(addr: &str, controller: Arc<dyn AdminController>) -> Result<(), GrpcHostError> {
+impl AdminGrpcService {
+    fn authorize<T>(&self, request: &Request<T>, resource: AdminResource) -> Result<(), AuthError> {
+        let metadata = request.metadata();
+        let bearer = metadata
+            .get("authorization")
+            .and_then(|value| value.to_str().ok());
+        let mtls = metadata
+            .get(self.auth.mtls_subject_header.as_str())
+            .and_then(|value| value.to_str().ok());
+        authorize_request(&self.auth, resource, bearer, mtls)
+    }
+}
+
+pub async fn serve(
+    addr: &str,
+    controller: Arc<dyn AdminController>,
+    auth: AuthConfig,
+) -> Result<(), GrpcHostError> {
     let socket: SocketAddr = addr
         .parse::<SocketAddr>()
         .map_err(|e| GrpcHostError::Bind(addr.to_string(), e.to_string()))?;
 
     Server::builder()
         .add_service(proto::admin_service_server::AdminServiceServer::new(
-            AdminGrpcService::new(controller),
+            AdminGrpcService::new(controller, auth),
         ))
         .serve(socket)
         .await
@@ -114,6 +166,18 @@ fn map_error_to_status(error: AdminControllerError) -> Status {
     }
 }
 
+fn map_auth_error(error: AuthError) -> Status {
+    match error {
+        AuthError::MissingBearer | AuthError::InvalidBearer => {
+            Status::unauthenticated(error.to_string())
+        }
+        AuthError::Forbidden | AuthError::UntrustedMtlsSubject => {
+            Status::permission_denied(error.to_string())
+        }
+        AuthError::MissingMtlsSubject => Status::unauthenticated(error.to_string()),
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum GrpcHostError {
     #[error("failed to bind grpc admin host on {0}: {1}")]
@@ -125,14 +189,14 @@ pub enum GrpcHostError {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::sync::Arc;
+    use std::sync::{Arc, RwLock};
     use std::time::SystemTime;
 
     use mx20022_store::{Store, TransactionRecord};
     use mx20022_store_sqlite::SqliteStore;
 
     use crate::controller::AdminController;
-    use crate::service::{RuntimeStatusSnapshot, StoreBackedAdminController};
+    use crate::service::{ReloadStatus, RuntimeStatusSnapshot, StoreBackedAdminController};
 
     use super::AdminGrpcService;
 
@@ -161,25 +225,45 @@ mod tests {
                 pipelines: vec!["demo".to_string()],
                 channels: vec!["http-in".to_string()],
                 store: "sqlite".to_string(),
+                started_at: SystemTime::now(),
+                reload_status: Arc::new(RwLock::new(ReloadStatus {
+                    config_version: "cfg-v1".to_string(),
+                    last_result: None,
+                    last_reloaded_at: None,
+                })),
             },
         ));
-        let service = AdminGrpcService::new(controller);
+        let service = AdminGrpcService::new(controller, crate::auth::AuthConfig::default());
 
+        let mut status_request = tonic::Request::new(());
+        status_request.metadata_mut().insert(
+            "authorization",
+            "Bearer admin"
+                .parse()
+                .expect("valid authorization metadata"),
+        );
         let status =
             <AdminGrpcService as super::proto::admin_service_server::AdminService>::get_status(
                 &service,
-                tonic::Request::new(()),
+                status_request,
             )
             .await
             .expect("status should return")
             .into_inner();
         assert_eq!(status.runtime, "rt");
 
+        let mut tx_request = tonic::Request::new(super::proto::GetTransactionRequest {
+            tx_id: "TX-GRPC-1".to_string(),
+        });
+        tx_request.metadata_mut().insert(
+            "authorization",
+            "Bearer admin"
+                .parse()
+                .expect("valid authorization metadata"),
+        );
         let tx = <AdminGrpcService as super::proto::admin_service_server::AdminService>::get_transaction(
             &service,
-            tonic::Request::new(super::proto::GetTransactionRequest {
-                tx_id: "TX-GRPC-1".to_string(),
-            }),
+            tx_request,
         )
         .await
         .expect("tx should return")

@@ -1,17 +1,26 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime};
 
 use mx20022_config::{ParticipantConfig, RuntimeConfig};
 use mx20022_correlation::{CorrelationEngine, CorrelationLookupKey};
+use mx20022_participants::acknowledgement_builder::AcknowledgementBuilder;
 use mx20022_participants::business_rule_validator::BusinessRuleValidator;
+use mx20022_participants::cbpr_rule_validator::CbprRuleValidator;
+use mx20022_participants::circuit_breaker::CircuitBreaker;
+use mx20022_participants::duplicate_checker::{DuplicateChecker, DuplicateKey};
+use mx20022_participants::error_response_builder::ErrorResponseBuilder;
+use mx20022_participants::fednow_rule_validator::FednowRuleValidator;
 use mx20022_participants::message_logger::MessageLogger;
+use mx20022_participants::rate_limiter::{LimitScope, RateLimiter};
+use mx20022_participants::routing_engine::{RouteRule, RoutingEngine};
 use mx20022_participants::schema_validator::SchemaValidator;
+use mx20022_participants::sepa_rule_validator::SepaRuleValidator;
 use mx20022_participants::status_response_builder::StatusResponseBuilder;
 use mx20022_runtime_core::context::{Context, ContextMeta};
 use mx20022_runtime_core::participant::Participant;
 use mx20022_runtime_core::transaction_manager::{TransactionManager, TransactionReport};
-use mx20022_store::Store;
+use mx20022_store::{Store, StoreQuery};
 use mx20022_store_postgres::PostgresStore;
 use mx20022_store_rocksdb::RocksDbStore;
 use mx20022_store_sqlite::SqliteStore;
@@ -19,8 +28,26 @@ use mx20022_store_sqlite::SqliteStore;
 use crate::application::TransactionUseCase;
 use crate::domain::{DomainError, TransactionRequest};
 
+struct ActiveTransactionGuard {
+    pipeline: String,
+}
+
+impl ActiveTransactionGuard {
+    fn new(pipeline: impl Into<String>) -> Self {
+        let pipeline = pipeline.into();
+        mx20022_metrics::inc_active_transactions(&pipeline);
+        Self { pipeline }
+    }
+}
+
+impl Drop for ActiveTransactionGuard {
+    fn drop(&mut self) {
+        mx20022_metrics::dec_active_transactions(&self.pipeline);
+    }
+}
+
 pub struct RuntimeApp {
-    pipelines: HashMap<String, PipelineRuntime>,
+    pipelines: RwLock<HashMap<String, PipelineRuntime>>,
     store: Arc<dyn Store>,
     correlation: Arc<CorrelationEngine>,
     runtime_name: String,
@@ -29,9 +56,33 @@ pub struct RuntimeApp {
     store_backend: String,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RecoveryReport {
+    pub attempted: usize,
+    pub recovered: usize,
+    pub failed: usize,
+}
+
 struct PipelineRuntime {
     message_types: Vec<String>,
-    manager: TransactionManager,
+    participant_names: Vec<String>,
+    manager: Arc<TransactionManager>,
+}
+
+impl Clone for PipelineRuntime {
+    fn clone(&self) -> Self {
+        Self {
+            message_types: self.message_types.clone(),
+            participant_names: self.participant_names.clone(),
+            manager: Arc::clone(&self.manager),
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ReloadReport {
+    pub pipelines_reloaded: usize,
+    pub participants_reloaded: usize,
 }
 
 impl RuntimeApp {
@@ -59,16 +110,21 @@ impl RuntimeApp {
         let mut pipelines = HashMap::new();
 
         for pipeline_cfg in &config.pipelines {
-            let participants = build_participants(&pipeline_cfg.participants)?;
+            let participants = build_participants(&pipeline_cfg.participants, Arc::clone(&store))?;
             let runtime = PipelineRuntime {
                 message_types: pipeline_cfg.message_types.clone(),
-                manager: TransactionManager::new(participants),
+                participant_names: pipeline_cfg
+                    .participants
+                    .iter()
+                    .map(|participant| participant.name.clone())
+                    .collect(),
+                manager: Arc::new(TransactionManager::new(participants)),
             };
             pipelines.insert(pipeline_cfg.name.clone(), runtime);
         }
 
         Ok(Self {
-            pipelines,
+            pipelines: RwLock::new(pipelines),
             store,
             correlation,
             runtime_name: config.runtime.name.clone(),
@@ -79,11 +135,19 @@ impl RuntimeApp {
     }
 
     pub fn pipeline_count(&self) -> usize {
-        self.pipelines.len()
+        self.pipelines
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
     }
 
     pub fn pipeline_names(&self) -> Vec<String> {
-        self.pipelines.keys().cloned().collect()
+        self.pipelines
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .keys()
+            .cloned()
+            .collect()
     }
 
     pub fn channel_names(&self) -> Vec<String> {
@@ -107,7 +171,11 @@ impl RuntimeApp {
     }
 
     pub fn accepts_message_type(&self, pipeline: &str, message_type: &str) -> bool {
-        let Some(runtime) = self.pipelines.get(pipeline) else {
+        let pipelines = self
+            .pipelines
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(runtime) = pipelines.get(pipeline) else {
             return false;
         };
 
@@ -129,7 +197,10 @@ impl RuntimeApp {
         let started = SystemTime::now();
         let runtime = self
             .pipelines
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(pipeline)
+            .cloned()
             .ok_or_else(|| RuntimeBuildError::UnknownPipeline(pipeline.to_string()))?;
 
         let request = TransactionRequest {
@@ -150,7 +221,7 @@ impl RuntimeApp {
         }
 
         let now = SystemTime::now();
-        mx20022_metrics::set_active_transactions(pipeline, 1);
+        let _active_guard = ActiveTransactionGuard::new(pipeline.to_string());
         let mut ctx = Context::new(ContextMeta {
             transaction_id: request.tx_id.clone(),
             received_at: now,
@@ -229,14 +300,151 @@ impl RuntimeApp {
                 mx20022_runtime_core::transaction_manager::Outcome::Poison => "poison",
             },
         );
-        mx20022_metrics::set_active_transactions(pipeline, 0);
+        Ok(report)
+    }
+
+    pub async fn recover_incomplete_transactions(
+        &self,
+        limit: usize,
+    ) -> Result<RecoveryReport, RuntimeBuildError> {
+        let mut report = RecoveryReport::default();
+        let states = [
+            "RECEIVED",
+            "PREPARING",
+            "PREPARED",
+            "COMMITTING",
+            "ABORTING",
+        ];
+
+        for state in states {
+            let remaining = limit.saturating_sub(report.attempted);
+            if remaining == 0 {
+                break;
+            }
+
+            let result = self
+                .store
+                .query(StoreQuery {
+                    pipeline: None,
+                    message_type: None,
+                    state: Some(state.to_string()),
+                    since: None,
+                    until: None,
+                    limit: Some(remaining),
+                })
+                .await
+                .map_err(RuntimeBuildError::Store)?;
+
+            for record in result.records {
+                report.attempted += 1;
+                let recovery = self
+                    .process(
+                        &record.pipeline,
+                        record.tx_id.clone(),
+                        record.source_channel.clone(),
+                        record.message_type.clone(),
+                        record.raw_message.clone(),
+                    )
+                    .await;
+
+                match recovery {
+                    Ok(_) => report.recovered += 1,
+                    Err(error) => {
+                        report.failed += 1;
+                        tracing::error!(
+                            tx_id = %record.tx_id,
+                            pipeline = %record.pipeline,
+                            state = %record.state,
+                            error = %error,
+                            "startup recovery replay failed"
+                        );
+                    }
+                }
+            }
+        }
 
         Ok(report)
+    }
+
+    pub async fn reload_participant_configs(
+        &self,
+        config: &RuntimeConfig,
+    ) -> Result<ReloadReport, RuntimeBuildError> {
+        let current = self
+            .pipelines
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        if current.len() != config.pipelines.len() {
+            return Err(RuntimeBuildError::TopologyReloadNotAllowed(
+                "pipeline count changed; restart is required".to_string(),
+            ));
+        }
+
+        for pipeline_cfg in &config.pipelines {
+            let Some(existing) = current.get(&pipeline_cfg.name) else {
+                return Err(RuntimeBuildError::TopologyReloadNotAllowed(format!(
+                    "pipeline `{}` does not exist in running topology",
+                    pipeline_cfg.name
+                )));
+            };
+            if existing.message_types != pipeline_cfg.message_types {
+                return Err(RuntimeBuildError::TopologyReloadNotAllowed(format!(
+                    "pipeline `{}` message_types changed; restart is required",
+                    pipeline_cfg.name
+                )));
+            }
+
+            let incoming_names = pipeline_cfg
+                .participants
+                .iter()
+                .map(|participant| participant.name.clone())
+                .collect::<Vec<_>>();
+            if existing.participant_names != incoming_names {
+                return Err(RuntimeBuildError::TopologyReloadNotAllowed(format!(
+                    "pipeline `{}` participant order/topology changed; restart is required",
+                    pipeline_cfg.name
+                )));
+            }
+        }
+        drop(current);
+
+        let mut rebuilt = HashMap::new();
+        for pipeline_cfg in &config.pipelines {
+            let participants =
+                build_participants(&pipeline_cfg.participants, Arc::clone(&self.store))?;
+            rebuilt.insert(
+                pipeline_cfg.name.clone(),
+                PipelineRuntime {
+                    message_types: pipeline_cfg.message_types.clone(),
+                    participant_names: pipeline_cfg
+                        .participants
+                        .iter()
+                        .map(|participant| participant.name.clone())
+                        .collect(),
+                    manager: Arc::new(TransactionManager::new(participants)),
+                },
+            );
+        }
+
+        let mut pipelines = self
+            .pipelines
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for (name, runtime) in rebuilt {
+            pipelines.insert(name, runtime);
+        }
+
+        Ok(ReloadReport {
+            pipelines_reloaded: config.pipelines.len(),
+            participants_reloaded: config.pipelines.iter().map(|p| p.participants.len()).sum(),
+        })
     }
 }
 
 fn build_participants(
     configs: &[ParticipantConfig],
+    store: Arc<dyn Store>,
 ) -> Result<Vec<Arc<dyn Participant>>, RuntimeBuildError> {
     let mut participants: Vec<Arc<dyn Participant>> = Vec::new();
 
@@ -250,6 +458,9 @@ fn build_participants(
                 participants.push(Arc::new(participant));
             }
             "schema-validator" => participants.push(Arc::new(SchemaValidator::new())),
+            "fednow-rule-validator" => participants.push(Arc::new(FednowRuleValidator::new())),
+            "sepa-rule-validator" => participants.push(Arc::new(SepaRuleValidator::new())),
+            "cbpr-rule-validator" => participants.push(Arc::new(CbprRuleValidator::new())),
             "business-rule-validator" => {
                 let mut validator = BusinessRuleValidator::new();
                 if let Some(scheme) = cfg.config.get("scheme").and_then(|v| v.as_str()) {
@@ -280,6 +491,157 @@ fn build_participants(
                     .unwrap_or(true);
                 participants.push(Arc::new(StatusResponseBuilder::new(auto)));
             }
+            "acknowledgement-builder" => {
+                let overwrite = cfg
+                    .config
+                    .get("overwrite_existing")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false);
+                participants.push(Arc::new(AcknowledgementBuilder::new(overwrite)));
+            }
+            "error-response-builder" => {
+                let overwrite = cfg
+                    .config
+                    .get("overwrite_existing")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false);
+                participants.push(Arc::new(ErrorResponseBuilder::new(overwrite)));
+            }
+            "duplicate-checker" => {
+                let keys = cfg
+                    .config
+                    .get("keys")
+                    .and_then(|value| value.as_array())
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(|item| item.as_str())
+                            .map(|item| match item {
+                                "message_id" | "msg_id" => Ok(DuplicateKey::MessageId),
+                                "end_to_end_id" | "e2e_id" => Ok(DuplicateKey::EndToEndId),
+                                "uetr" => Ok(DuplicateKey::Uetr),
+                                other => Err(RuntimeBuildError::UnknownParticipant(format!(
+                                    "duplicate-checker key `{other}`"
+                                ))),
+                            })
+                            .collect::<Result<Vec<_>, _>>()
+                    })
+                    .transpose()?
+                    .unwrap_or_else(|| {
+                        vec![
+                            DuplicateKey::MessageId,
+                            DuplicateKey::EndToEndId,
+                            DuplicateKey::Uetr,
+                        ]
+                    });
+                participants.push(Arc::new(
+                    DuplicateChecker::new(Arc::clone(&store)).with_keys(keys),
+                ));
+            }
+            "routing-engine" => {
+                let default_route = cfg
+                    .config
+                    .get("default_route")
+                    .and_then(|value| value.as_str())
+                    .map(ToString::to_string);
+                let mut engine = RoutingEngine::new(default_route);
+
+                if let Some(rules) = cfg.config.get("rules").and_then(|value| value.as_array()) {
+                    for rule in rules {
+                        let table = rule.as_table().ok_or_else(|| {
+                            RuntimeBuildError::UnknownParticipant(
+                                "routing-engine rule must be an inline table".to_string(),
+                            )
+                        })?;
+                        let destination = table
+                            .get("destination")
+                            .and_then(|value| value.as_str())
+                            .ok_or_else(|| {
+                                RuntimeBuildError::UnknownParticipant(
+                                    "routing-engine rule requires destination".to_string(),
+                                )
+                            })?
+                            .to_string();
+                        engine = engine.with_rule(RouteRule {
+                            destination,
+                            message_type: table
+                                .get("message_type")
+                                .and_then(|value| value.as_str())
+                                .map(ToString::to_string),
+                            currency: table
+                                .get("currency")
+                                .and_then(|value| value.as_str())
+                                .map(ToString::to_string),
+                            bic_prefix: table
+                                .get("bic_prefix")
+                                .and_then(|value| value.as_str())
+                                .map(ToString::to_string),
+                        });
+                    }
+                }
+
+                participants.push(Arc::new(engine));
+            }
+            "rate-limiter" => {
+                let rate = cfg
+                    .config
+                    .get("rate_per_second")
+                    .and_then(|value| value.as_float())
+                    .or_else(|| {
+                        cfg.config
+                            .get("rate_per_second")
+                            .and_then(|value| value.as_integer().map(|v| v as f64))
+                    })
+                    .unwrap_or(100.0);
+                let burst = cfg
+                    .config
+                    .get("burst")
+                    .and_then(|value| value.as_float())
+                    .or_else(|| {
+                        cfg.config
+                            .get("burst")
+                            .and_then(|value| value.as_integer().map(|v| v as f64))
+                    })
+                    .unwrap_or(rate.max(1.0));
+                let scope = match cfg
+                    .config
+                    .get("scope")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("global")
+                {
+                    "global" => LimitScope::Global,
+                    "message_type" => LimitScope::MessageType,
+                    "source_channel" => LimitScope::SourceChannel,
+                    other => {
+                        return Err(RuntimeBuildError::UnknownParticipant(format!(
+                            "rate-limiter scope `{other}`"
+                        )))
+                    }
+                };
+                participants.push(Arc::new(RateLimiter::new(
+                    rate.max(0.1),
+                    burst.max(1.0),
+                    scope,
+                )));
+            }
+            "circuit-breaker" => {
+                let threshold = cfg
+                    .config
+                    .get("failure_threshold")
+                    .and_then(|value| value.as_integer())
+                    .and_then(|value| u32::try_from(value).ok())
+                    .unwrap_or(5);
+                let open_ms = cfg
+                    .config
+                    .get("open_ms")
+                    .and_then(|value| value.as_integer())
+                    .and_then(|value| u64::try_from(value).ok())
+                    .unwrap_or(30_000);
+                participants.push(Arc::new(CircuitBreaker::new(
+                    threshold,
+                    Duration::from_millis(open_ms),
+                )));
+            }
             other => {
                 return Err(RuntimeBuildError::UnknownParticipant(other.to_string()));
             }
@@ -297,6 +659,8 @@ pub enum RuntimeBuildError {
     UnsupportedStoreBackend(String),
     #[error("unknown pipeline `{0}`")]
     UnknownPipeline(String),
+    #[error("topology reload is not allowed: {0}")]
+    TopologyReloadNotAllowed(String),
     #[error("message type `{message_type}` not accepted by pipeline `{pipeline}`")]
     MessageTypeNotAccepted {
         pipeline: String,
@@ -314,8 +678,13 @@ pub enum RuntimeBuildError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::SystemTime;
+
     use mx20022_config::RuntimeConfig;
     use mx20022_runtime_core::transaction_manager::Outcome;
+    use mx20022_store::{Store, TransactionRecord};
 
     use crate::app::RuntimeApp;
 
@@ -367,5 +736,234 @@ participants = [
             .expect("process should succeed");
 
         assert_eq!(report.outcome, Outcome::Committed);
+    }
+
+    const DUPLICATE_GUARD_CONFIG: &str = r#"
+[runtime]
+name = "test-runtime"
+instance_id = "local-01"
+
+[store]
+backend = "sqlite"
+url = "sqlite::memory:"
+
+[channels.http-in]
+type = "http"
+mode = "server"
+bind = "127.0.0.1:8080"
+
+[[pipeline]]
+name = "duplicate-guard"
+channel_in = "http-in"
+message_types = ["pacs.008"]
+participants = [
+  { name = "error-response-builder", config = { overwrite_existing = true } },
+  { name = "duplicate-checker", config = { keys = ["message_id"] } },
+]
+"#;
+
+    #[tokio::test]
+    async fn duplicate_checker_aborts_pipeline_when_message_id_exists() {
+        let config = RuntimeConfig::parse(DUPLICATE_GUARD_CONFIG).expect("config should parse");
+        let app = RuntimeApp::from_config(&config)
+            .await
+            .expect("app should build");
+
+        let store: Arc<dyn Store> = app.store_handle();
+        let mut key_fields = HashMap::new();
+        key_fields.insert("message_id".to_string(), "MSG-DUP-1".to_string());
+        store
+            .begin_transaction(&TransactionRecord {
+                tx_id: "TX-OLD".to_string(),
+                pipeline: "duplicate-guard".to_string(),
+                source_channel: "http-in".to_string(),
+                message_type: "pacs.008".to_string(),
+                raw_message: "<Document/>".to_string(),
+                state: "COMMITTED".to_string(),
+                received_at: SystemTime::now(),
+                completed_at: Some(SystemTime::now()),
+                key_fields,
+            })
+            .await
+            .expect("seed tx should succeed");
+
+        let xml = "<Document><FIToFICstmrCdtTrf><GrpHdr><MsgId>MSG-DUP-1</MsgId></GrpHdr></FIToFICstmrCdtTrf></Document>";
+        let report = app
+            .process("duplicate-guard", "TX-NEW", "http-in", "pacs.008", xml)
+            .await
+            .expect("process should return report");
+
+        assert_eq!(report.outcome, Outcome::Aborted);
+    }
+
+    const RECOVERY_CONFIG: &str = r#"
+[runtime]
+name = "test-runtime"
+instance_id = "local-01"
+
+[store]
+backend = "sqlite"
+url = "sqlite::memory:"
+
+[channels.http-in]
+type = "http"
+mode = "server"
+bind = "127.0.0.1:8080"
+
+[[pipeline]]
+name = "recovery"
+channel_in = "http-in"
+message_types = ["pacs.008"]
+participants = [
+  { name = "message-logger", config = {} },
+]
+"#;
+
+    #[tokio::test]
+    async fn recovers_incomplete_transactions_from_store() {
+        let config = RuntimeConfig::parse(RECOVERY_CONFIG).expect("config should parse");
+        let app = RuntimeApp::from_config(&config)
+            .await
+            .expect("app should build");
+
+        let store: Arc<dyn Store> = app.store_handle();
+        store
+            .begin_transaction(&TransactionRecord {
+                tx_id: "TX-REC-1".to_string(),
+                pipeline: "recovery".to_string(),
+                source_channel: "http-in".to_string(),
+                message_type: "pacs.008".to_string(),
+                raw_message: "<Document/>".to_string(),
+                state: "PREPARING".to_string(),
+                received_at: SystemTime::now(),
+                completed_at: None,
+                key_fields: HashMap::new(),
+            })
+            .await
+            .expect("seed tx should succeed");
+
+        let report = app
+            .recover_incomplete_transactions(10)
+            .await
+            .expect("recovery should run");
+        assert_eq!(report.attempted, 1);
+        assert_eq!(report.recovered, 1);
+        assert_eq!(report.failed, 0);
+
+        let updated = store
+            .find_by_id("TX-REC-1")
+            .await
+            .expect("lookup should succeed")
+            .expect("record should exist");
+        assert_eq!(updated.state, "COMMITTED");
+    }
+
+    const RELOAD_CONFIG_BASE: &str = r#"
+[runtime]
+name = "test-runtime"
+instance_id = "local-01"
+
+[store]
+backend = "sqlite"
+url = "sqlite::memory:"
+
+[channels.http-in]
+type = "http"
+mode = "server"
+bind = "127.0.0.1:8080"
+
+[[pipeline]]
+name = "reloadable"
+channel_in = "http-in"
+message_types = ["pacs.008"]
+participants = [
+  { name = "rate-limiter", config = { rate_per_second = 10, burst = 20, scope = "global" } },
+  { name = "message-logger", config = { tag = "v1" } },
+]
+"#;
+
+    const RELOAD_CONFIG_UPDATED: &str = r#"
+[runtime]
+name = "test-runtime"
+instance_id = "local-01"
+
+[store]
+backend = "sqlite"
+url = "sqlite::memory:"
+
+[channels.http-in]
+type = "http"
+mode = "server"
+bind = "127.0.0.1:8080"
+
+[[pipeline]]
+name = "reloadable"
+channel_in = "http-in"
+message_types = ["pacs.008"]
+participants = [
+  { name = "rate-limiter", config = { rate_per_second = 100, burst = 200, scope = "source_channel" } },
+  { name = "message-logger", config = { tag = "v2" } },
+]
+"#;
+
+    const RELOAD_CONFIG_TOPOLOGY_CHANGE: &str = r#"
+[runtime]
+name = "test-runtime"
+instance_id = "local-01"
+
+[store]
+backend = "sqlite"
+url = "sqlite::memory:"
+
+[channels.http-in]
+type = "http"
+mode = "server"
+bind = "127.0.0.1:8080"
+
+[[pipeline]]
+name = "reloadable"
+channel_in = "http-in"
+message_types = ["pacs.008"]
+participants = [
+  { name = "message-logger", config = { tag = "v2" } },
+]
+"#;
+
+    #[tokio::test]
+    async fn reloads_participant_configs_when_topology_is_unchanged() {
+        let base = RuntimeConfig::parse(RELOAD_CONFIG_BASE).expect("base config should parse");
+        let app = RuntimeApp::from_config(&base)
+            .await
+            .expect("app should build");
+        let updated =
+            RuntimeConfig::parse(RELOAD_CONFIG_UPDATED).expect("updated config should parse");
+
+        let report = app
+            .reload_participant_configs(&updated)
+            .await
+            .expect("reload should succeed");
+        assert_eq!(report.pipelines_reloaded, 1);
+        assert_eq!(report.participants_reloaded, 2);
+    }
+
+    #[tokio::test]
+    async fn rejects_reload_when_participant_topology_changes() {
+        let base = RuntimeConfig::parse(RELOAD_CONFIG_BASE).expect("base config should parse");
+        let app = RuntimeApp::from_config(&base)
+            .await
+            .expect("app should build");
+        let changed = RuntimeConfig::parse(RELOAD_CONFIG_TOPOLOGY_CHANGE)
+            .expect("changed config should parse");
+
+        let error = app
+            .reload_participant_configs(&changed)
+            .await
+            .expect_err("reload should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("participant order/topology changed"),
+            "unexpected error: {error}"
+        );
     }
 }

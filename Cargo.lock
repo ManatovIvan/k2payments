@@ -1624,6 +1624,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "jsonwebtoken"
+version = "9.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a87cc7a48537badeae96744432de36f4be2b4a34a05a5ef32e9dd8a1c169dde"
+dependencies = [
+ "base64",
+ "js-sys",
+ "pem",
+ "ring",
+ "serde",
+ "serde_json",
+ "simple_asn1",
+]
+
+[[package]]
 name = "lapin"
 version = "2.5.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1838,6 +1853,7 @@ version = "0.1.0-alpha.1"
 dependencies = [
  "async-trait",
  "axum",
+ "jsonwebtoken",
  "mx20022-metrics",
  "mx20022-store",
  "mx20022-store-sqlite",
@@ -1940,7 +1956,9 @@ name = "mx20022-channels"
 version = "0.1.0-alpha.1"
 dependencies = [
  "async-trait",
+ "jsonwebtoken",
  "serde",
+ "serde_json",
  "thiserror 1.0.69",
  "tokio",
 ]
@@ -2035,6 +2053,8 @@ dependencies = [
  "mx20022-model",
  "mx20022-parse",
  "mx20022-runtime-core",
+ "mx20022-store",
+ "mx20022-store-sqlite",
  "mx20022-validate",
  "regex",
  "tokio",
@@ -2045,6 +2065,7 @@ dependencies = [
 name = "mx20022-runtime"
 version = "0.1.0-alpha.1"
 dependencies = [
+ "async-trait",
  "mx20022-admin",
  "mx20022-channel-amqp",
  "mx20022-channel-file",
@@ -2074,6 +2095,7 @@ name = "mx20022-runtime-core"
 version = "0.1.0-alpha.1"
 dependencies = [
  "async-trait",
+ "mx20022-metrics",
  "serde",
  "thiserror 1.0.69",
  "tokio",
@@ -2331,6 +2353,16 @@ checksum = "f8ed6a7761f76e3b9f92dfb0a60a6a6477c61024b775147ff0973a02653abaf2"
 dependencies = [
  "digest",
  "hmac",
+]
+
+[[package]]
+name = "pem"
+version = "3.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d30c53c26bc5b31a98cd02d20f25a7c8567146caf63ed593a9d87b2775291be"
+dependencies = [
+ "base64",
+ "serde_core",
 ]
 
 [[package]]
@@ -3306,6 +3338,18 @@ checksum = "77549399552de45a898a580c1b41d445bf730df867cc44e6c0233bbc4b8329de"
 dependencies = [
  "digest",
  "rand_core 0.6.4",
+]
+
+[[package]]
+name = "simple_asn1"
+version = "0.6.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0d585997b0ac10be3c5ee635f1bab02d512760d14b7c468801ac8a01d9ae5f1d"
+dependencies = [
+ "num-bigint",
+ "num-traits",
+ "thiserror 2.0.18",
+ "time",
 ]
 
 [[package]]

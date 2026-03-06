@@ -6,7 +6,7 @@ use mx20022_store::{
     ContextEntry, DeadLetter, DeadLetterQuery, ExpUpdate, Expectation, Outcome, QueryResult, Store,
     StoreError, StoreHealth, StoreQuery, TransactionRecord, TransactionUpdate,
 };
-use sqlx::{Pool, Row, Sqlite, SqlitePool};
+use sqlx::{Pool, QueryBuilder, Row, Sqlite, SqlitePool};
 use tokio::sync::OnceCell;
 
 #[cfg(test)]
@@ -133,6 +133,14 @@ fn encode_time(time: SystemTime) -> String {
         .unwrap_or_else(|_| Duration::from_secs(0))
         .as_millis();
     millis.to_string()
+}
+
+fn encode_time_i64(time: SystemTime) -> i64 {
+    let millis = time
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| Duration::from_secs(0))
+        .as_millis();
+    i64::try_from(millis).unwrap_or(i64::MAX)
 }
 
 fn decode_time(value: &str) -> SystemTime {
@@ -271,6 +279,38 @@ impl Store for SqliteStore {
         Ok(())
     }
 
+    async fn list_context_entries(&self, tx_id: &str) -> Result<Vec<ContextEntry>, StoreError> {
+        self.ensure_initialized().await?;
+        let rows = sqlx::query(
+            "SELECT tx_id, key, writer, written_at FROM context_mutations WHERE tx_id = ?1 ORDER BY CAST(written_at AS INTEGER) ASC",
+        )
+        .bind(tx_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StoreError::new(format!("list_context_entries failed: {e}")))?;
+
+        let mut entries = Vec::new();
+        for row in rows {
+            let written_at_raw: String = row.try_get("written_at").map_err(|e| {
+                StoreError::new(format!("context row mapping written_at failed: {e}"))
+            })?;
+            entries.push(ContextEntry {
+                tx_id: row.try_get("tx_id").map_err(|e| {
+                    StoreError::new(format!("context row mapping tx_id failed: {e}"))
+                })?,
+                key: row
+                    .try_get("key")
+                    .map_err(|e| StoreError::new(format!("context row mapping key failed: {e}")))?,
+                writer: row.try_get("writer").map_err(|e| {
+                    StoreError::new(format!("context row mapping writer failed: {e}"))
+                })?,
+                written_at: decode_time(&written_at_raw),
+            });
+        }
+
+        Ok(entries)
+    }
+
     async fn find_by_id(&self, tx_id: &str) -> Result<Option<TransactionRecord>, StoreError> {
         self.ensure_initialized().await?;
         let row = sqlx::query(
@@ -302,50 +342,56 @@ impl Store for SqliteStore {
 
     async fn query(&self, filter: StoreQuery) -> Result<QueryResult, StoreError> {
         self.ensure_initialized().await?;
-        let rows = sqlx::query(
-            "SELECT tx_id, pipeline, source_channel, message_type, raw_message, state, received_at, completed_at, key_fields_json
-             FROM transactions ORDER BY received_at DESC",
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| StoreError::new(format!("query failed: {e}")))?;
+        let mut qb = QueryBuilder::<Sqlite>::new(
+            "SELECT tx_id, pipeline, source_channel, message_type, raw_message, state, received_at, completed_at, key_fields_json FROM transactions",
+        );
+        let mut has_where = false;
+
+        if let Some(pipeline) = &filter.pipeline {
+            qb.push(if has_where { " AND " } else { " WHERE " });
+            qb.push("pipeline = ");
+            qb.push_bind(pipeline);
+            has_where = true;
+        }
+        if let Some(message_type) = &filter.message_type {
+            qb.push(if has_where { " AND " } else { " WHERE " });
+            qb.push("message_type = ");
+            qb.push_bind(message_type);
+            has_where = true;
+        }
+        if let Some(state) = &filter.state {
+            qb.push(if has_where { " AND " } else { " WHERE " });
+            qb.push("state = ");
+            qb.push_bind(state);
+            has_where = true;
+        }
+        if let Some(since) = filter.since {
+            qb.push(if has_where { " AND " } else { " WHERE " });
+            qb.push("CAST(received_at AS INTEGER) >= ");
+            qb.push_bind(encode_time_i64(since));
+            has_where = true;
+        }
+        if let Some(until) = filter.until {
+            qb.push(if has_where { " AND " } else { " WHERE " });
+            qb.push("CAST(received_at AS INTEGER) <= ");
+            qb.push_bind(encode_time_i64(until));
+        }
+
+        qb.push(" ORDER BY CAST(received_at AS INTEGER) DESC");
+        if let Some(limit) = filter.limit {
+            qb.push(" LIMIT ");
+            qb.push_bind(i64::try_from(limit).unwrap_or(i64::MAX));
+        }
+
+        let rows = qb
+            .build()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::new(format!("query failed: {e}")))?;
 
         let mut records = Vec::new();
         for row in rows {
-            let record = map_transaction_row(row)?;
-
-            if let Some(ref pipeline) = filter.pipeline {
-                if &record.pipeline != pipeline {
-                    continue;
-                }
-            }
-            if let Some(ref message_type) = filter.message_type {
-                if &record.message_type != message_type {
-                    continue;
-                }
-            }
-            if let Some(ref state) = filter.state {
-                if &record.state != state {
-                    continue;
-                }
-            }
-            if let Some(since) = filter.since {
-                if record.received_at < since {
-                    continue;
-                }
-            }
-            if let Some(until) = filter.until {
-                if record.received_at > until {
-                    continue;
-                }
-            }
-
-            records.push(record);
-            if let Some(limit) = filter.limit {
-                if records.len() >= limit {
-                    break;
-                }
-            }
+            records.push(map_transaction_row(row)?);
         }
 
         Ok(QueryResult {
@@ -504,13 +550,13 @@ impl Store for SqliteStore {
 
     async fn replay_dead_letter(&self, id: &str) -> Result<(), StoreError> {
         self.ensure_initialized().await?;
-        let exists = sqlx::query("SELECT id FROM dead_letters WHERE id = ?1")
+        let result = sqlx::query("DELETE FROM dead_letters WHERE id = ?1")
             .bind(id)
-            .fetch_optional(&self.pool)
+            .execute(&self.pool)
             .await
             .map_err(|e| StoreError::new(format!("replay_dead_letter failed: {e}")))?;
 
-        if exists.is_none() {
+        if result.rows_affected() == 0 {
             return Err(StoreError::new(format!("dead letter not found: {id}")));
         }
 
@@ -548,7 +594,7 @@ mod tests {
 
     use mx20022_store::{
         ContextEntry, DeadLetter, DeadLetterQuery, ExpUpdate, Expectation, Outcome, Store,
-        TransactionRecord, TransactionUpdate,
+        StoreQuery, TransactionRecord, TransactionUpdate,
     };
 
     use crate::SqliteStore;
@@ -637,6 +683,13 @@ mod tests {
             .await
             .expect("append context should work");
 
+        let entries = store
+            .list_context_entries("2")
+            .await
+            .expect("list context should work");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].writer, "routing-engine");
+
         store
             .save_expectation(&Expectation {
                 id: "EXP-1".to_string(),
@@ -688,5 +741,56 @@ mod tests {
             .replay_dead_letter("DL-1")
             .await
             .expect("replay dead letter should work");
+
+        let dead_letters_after = store
+            .list_dead_letters(DeadLetterQuery {
+                pipeline: Some("demo".to_string()),
+                limit: Some(10),
+            })
+            .await
+            .expect("list dead letters should work");
+        assert!(dead_letters_after.is_empty());
+    }
+
+    #[tokio::test]
+    async fn query_applies_sql_filters_and_limit() {
+        let store = SqliteStore::new("sqlite::memory:");
+        let now = SystemTime::now();
+
+        let mut a = record("q-a");
+        a.pipeline = "alpha".to_string();
+        a.state = "PREPARING".to_string();
+        a.received_at = now;
+
+        let mut b = record("q-b");
+        b.pipeline = "beta".to_string();
+        b.state = "PREPARING".to_string();
+        b.received_at = now;
+
+        let mut c = record("q-c");
+        c.pipeline = "alpha".to_string();
+        c.state = "COMMITTED".to_string();
+        c.received_at = now;
+
+        store.begin_transaction(&a).await.expect("insert a");
+        store.begin_transaction(&b).await.expect("insert b");
+        store.begin_transaction(&c).await.expect("insert c");
+
+        let result = store
+            .query(StoreQuery {
+                pipeline: Some("alpha".to_string()),
+                message_type: None,
+                state: Some("PREPARING".to_string()),
+                since: Some(now),
+                until: None,
+                limit: Some(1),
+            })
+            .await
+            .expect("query should succeed");
+
+        assert_eq!(result.records.len(), 1);
+        assert_eq!(result.total, 1);
+        assert_eq!(result.records[0].pipeline, "alpha");
+        assert_eq!(result.records[0].state, "PREPARING");
     }
 }

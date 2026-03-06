@@ -17,6 +17,15 @@ pub struct StatusResponseDto {
     pub pipelines: Vec<String>,
     pub channels: Vec<String>,
     pub store: String,
+    pub uptime_ms: String,
+    pub store_ok: bool,
+    pub store_details: Option<String>,
+    pub in_flight_count: usize,
+    pub pending_correlation_count: usize,
+    pub dead_letter_count: usize,
+    pub config_version: String,
+    pub last_reload_result: Option<String>,
+    pub last_reload_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -27,4 +36,10 @@ pub struct TransactionResponseDto {
     pub state: String,
     pub received_at: String,
     pub completed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReloadResponseDto {
+    pub reloaded: bool,
+    pub details: String,
 }

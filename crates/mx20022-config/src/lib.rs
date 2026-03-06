@@ -76,6 +76,43 @@ impl RuntimeConfig {
             }
         }
 
+        let auth = &self.runtime.admin_auth;
+        match auth.mode.as_str() {
+            "disabled" | "legacy_bearer" => {}
+            "jwt_hs256" => {
+                if auth
+                    .jwt_hs256_secret
+                    .as_ref()
+                    .map(|value| value.trim().is_empty())
+                    .unwrap_or(true)
+                {
+                    return Err(ConfigError::Validation(
+                        "runtime.admin_auth.jwt_hs256_secret must be set when mode=jwt_hs256"
+                            .to_string(),
+                    ));
+                }
+            }
+            other => {
+                return Err(ConfigError::Validation(format!(
+                    "runtime.admin_auth.mode `{other}` is invalid (expected disabled|legacy_bearer|jwt_hs256)"
+                )));
+            }
+        }
+
+        if auth.require_mtls_subject && auth.mtls_subject_header.trim().is_empty() {
+            return Err(ConfigError::Validation(
+                "runtime.admin_auth.mtls_subject_header must not be empty when require_mtls_subject=true".to_string(),
+            ));
+        }
+
+        if let Some(limit) = self.runtime.recovery_startup_limit {
+            if limit == 0 {
+                return Err(ConfigError::Validation(
+                    "runtime.recovery_startup_limit must be greater than 0".to_string(),
+                ));
+            }
+        }
+
         Ok(())
     }
 }
@@ -94,10 +131,90 @@ pub struct RuntimeSection {
     pub admin_grpc_bind: Option<String>,
     #[serde(default)]
     pub correlation_scan_interval_ms: Option<u64>,
+    #[serde(default)]
+    pub participant_reload_poll_ms: Option<u64>,
+    #[serde(default = "default_recover_incomplete_on_startup")]
+    pub recover_incomplete_on_startup: bool,
+    #[serde(default)]
+    pub recovery_startup_limit: Option<usize>,
+    #[serde(default)]
+    pub admin_auth: AdminAuthSection,
 }
 
 fn default_log_level() -> String {
     "info".to_string()
+}
+
+fn default_recover_incomplete_on_startup() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AdminAuthSection {
+    #[serde(default = "default_admin_auth_mode")]
+    pub mode: String,
+    #[serde(default)]
+    pub jwt_hs256_secret: Option<String>,
+    #[serde(default)]
+    pub jwt_issuer: Option<String>,
+    #[serde(default)]
+    pub jwt_audience: Option<String>,
+    #[serde(default = "default_ready_roles")]
+    pub ready_roles: Vec<String>,
+    #[serde(default = "default_status_roles")]
+    pub status_roles: Vec<String>,
+    #[serde(default = "default_tx_roles")]
+    pub tx_roles: Vec<String>,
+    #[serde(default = "default_reload_roles")]
+    pub reload_roles: Vec<String>,
+    #[serde(default)]
+    pub require_mtls_subject: bool,
+    #[serde(default = "default_mtls_subject_header")]
+    pub mtls_subject_header: String,
+    #[serde(default)]
+    pub mtls_allowed_subjects: Vec<String>,
+}
+
+impl Default for AdminAuthSection {
+    fn default() -> Self {
+        Self {
+            mode: default_admin_auth_mode(),
+            jwt_hs256_secret: None,
+            jwt_issuer: None,
+            jwt_audience: None,
+            ready_roles: default_ready_roles(),
+            status_roles: default_status_roles(),
+            tx_roles: default_tx_roles(),
+            reload_roles: default_reload_roles(),
+            require_mtls_subject: false,
+            mtls_subject_header: default_mtls_subject_header(),
+            mtls_allowed_subjects: Vec::new(),
+        }
+    }
+}
+
+fn default_admin_auth_mode() -> String {
+    "legacy_bearer".to_string()
+}
+
+fn default_ready_roles() -> Vec<String> {
+    vec!["admin.read".to_string(), "admin".to_string()]
+}
+
+fn default_status_roles() -> Vec<String> {
+    vec!["admin.read".to_string(), "admin".to_string()]
+}
+
+fn default_tx_roles() -> Vec<String> {
+    vec!["admin.tx.read".to_string(), "admin".to_string()]
+}
+
+fn default_reload_roles() -> Vec<String> {
+    vec!["admin.write".to_string(), "admin".to_string()]
+}
+
+fn default_mtls_subject_header() -> String {
+    "x-client-cert-subject".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -152,4 +269,52 @@ pub enum ConfigError {
     Parse(#[from] toml::de::Error),
     #[error("config validation error: {0}")]
     Validation(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RuntimeConfig;
+
+    const BASE_CONFIG: &str = r#"
+[runtime]
+name = "runtime"
+instance_id = "local"
+
+[store]
+backend = "sqlite"
+url = "sqlite::memory:"
+
+[channels.http-in]
+type = "http"
+mode = "server"
+bind = "127.0.0.1:8080"
+
+[[pipeline]]
+name = "demo"
+channel_in = "http-in"
+participants = [{ name = "message-logger" }]
+"#;
+
+    #[test]
+    fn rejects_invalid_admin_auth_mode() {
+        let config = format!("{BASE_CONFIG}\n[runtime.admin_auth]\nmode = \"invalid\"\n");
+        let result = RuntimeConfig::parse(&config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn requires_jwt_secret_when_jwt_mode_enabled() {
+        let config = format!("{BASE_CONFIG}\n[runtime.admin_auth]\nmode = \"jwt_hs256\"\n");
+        let result = RuntimeConfig::parse(&config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn accepts_jwt_mode_with_secret() {
+        let config = format!(
+            "{BASE_CONFIG}\n[runtime.admin_auth]\nmode = \"jwt_hs256\"\njwt_hs256_secret = \"secret\"\n"
+        );
+        let result = RuntimeConfig::parse(&config);
+        assert!(result.is_ok());
+    }
 }

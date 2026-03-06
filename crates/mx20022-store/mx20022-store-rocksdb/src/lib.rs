@@ -94,6 +94,50 @@ impl Store for RocksDbStore {
         run_blocking(move || put_value(&db, &key, &value)).await
     }
 
+    async fn list_context_entries(&self, tx_id: &str) -> Result<Vec<ContextEntry>, StoreError> {
+        let db = Arc::clone(&self.db);
+        let prefix = format!("ctx:{tx_id}:");
+        run_blocking(move || {
+            let mut entries = Vec::new();
+            for item in db.iterator(IteratorMode::Start) {
+                let (key, value) =
+                    item.map_err(|e| StoreError::new(format!("rocksdb iterator failed: {e}")))?;
+                let key = String::from_utf8_lossy(&key);
+                if !key.starts_with(&prefix) {
+                    continue;
+                }
+                let value: Value = serde_json::from_slice(&value)
+                    .map_err(|e| StoreError::new(format!("context decode failed: {e}")))?;
+                entries.push(ContextEntry {
+                    tx_id: value
+                        .get("tx_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    key: value
+                        .get("key")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    writer: value
+                        .get("writer")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    written_at: decode_time(
+                        value
+                            .get("written_at")
+                            .and_then(Value::as_i64)
+                            .unwrap_or_default(),
+                    ),
+                });
+            }
+            entries.sort_by_key(|entry| encode_time(entry.written_at));
+            Ok(entries)
+        })
+        .await
+    }
+
     async fn find_by_id(&self, tx_id: &str) -> Result<Option<TransactionRecord>, StoreError> {
         let db = Arc::clone(&self.db);
         let key = format!("tx:{tx_id}");
@@ -292,19 +336,21 @@ impl Store for RocksDbStore {
     }
 
     async fn replay_dead_letter(&self, id: &str) -> Result<(), StoreError> {
-        let exists = self
-            .list_dead_letters(DeadLetterQuery {
-                pipeline: None,
-                limit: None,
-            })
-            .await?
-            .into_iter()
-            .any(|v| v.id == id);
-        if exists {
+        let db = Arc::clone(&self.db);
+        let id = id.to_string();
+        let key = format!("dl:{id}");
+        run_blocking(move || {
+            let exists = db
+                .get(&key)
+                .map_err(|e| StoreError::new(format!("rocksdb get failed: {e}")))?;
+            if exists.is_none() {
+                return Err(StoreError::new(format!("dead letter not found: {id}")));
+            }
+            db.delete(&key)
+                .map_err(|e| StoreError::new(format!("rocksdb delete failed: {e}")))?;
             Ok(())
-        } else {
-            Err(StoreError::new(format!("dead letter not found: {id}")))
-        }
+        })
+        .await
     }
 
     async fn health(&self) -> Result<StoreHealth, StoreError> {
