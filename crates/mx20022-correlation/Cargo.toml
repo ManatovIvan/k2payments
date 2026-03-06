@@ -1,0 +1,15 @@
+[package]
+name = "mx20022-correlation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+mx20022-store = { path = "../mx20022-store" }
+
+[dev-dependencies]
+mx20022-store-sqlite = { path = "../mx20022-store/mx20022-store-sqlite" }

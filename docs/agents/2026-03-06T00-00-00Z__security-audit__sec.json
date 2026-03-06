@@ -1,0 +1,58 @@
+{
+  "metadata": {
+    "task_short": "security-audit",
+    "agent_abbr": "sec",
+    "datetime_utc": "2026-03-06T00:00:00Z",
+    "filename": "2026-03-06T00-00-00Z__security-audit__sec.json",
+    "supersedes": null,
+    "version": "1.0"
+  },
+  "state": {
+    "objectives": ["Full security audit of mx20022-runtime workspace"],
+    "constraints": ["Financial transaction processing - high security bar"],
+    "important_facts": [
+      "Admin API uses bearer token auth with no cryptographic verification",
+      "Any non-empty bearer token is accepted as valid",
+      "TCP channel has no max frame size limit",
+      "No TLS on admin or inbound HTTP servers",
+      "Database URL leaked in health endpoint response",
+      "Internal error messages forwarded to HTTP clients",
+      "SQL queries use parameterized queries correctly",
+      "Crypto module uses SHA-256 for key derivation instead of proper KDF"
+    ],
+    "decisions_made": [],
+    "artifacts": ["docs/agents/2026-03-06T00-00-00Z__security-audit__sec.json"],
+    "dependencies": [],
+    "risks_issues": [
+      "CRITICAL: No real token validation - any string accepted as auth",
+      "CRITICAL: TCP frame size unbounded - OOM DoS vector",
+      "HIGH: Internal error strings leaked to clients",
+      "HIGH: Database URL leaked in health response",
+      "HIGH: No TLS on any listener"
+    ]
+  },
+  "iteration": {
+    "summary": "Performed comprehensive security audit of 10 source files across the mx20022-runtime workspace. Identified 3 critical, 4 high, 4 medium, and 3 low severity findings. Key concerns: bearer token auth accepts any string without cryptographic verification, TCP channel allows unbounded frame allocation, internal error messages leak to HTTP clients, and database connection URLs are exposed via the health endpoint.",
+    "inputs_consulted": [
+      "crates/mx20022-admin/src/http.rs",
+      "crates/mx20022-admin/src/host.rs",
+      "crates/mx20022-admin/src/service.rs",
+      "crates/mx20022-store/mx20022-store-sqlite/src/lib.rs",
+      "crates/mx20022-channels/mx20022-channel-http/src/lib.rs",
+      "crates/mx20022-channels/mx20022-channel-tcp/src/lib.rs",
+      "crates/mx20022-runtime/src/domain.rs",
+      "crates/mx20022-runtime/src/app.rs",
+      "crates/mx20022-runtime-core/src/context.rs",
+      "crates/mx20022-cli/src/main.rs",
+      "crates/mx20022-config/src/lib.rs",
+      "crates/mx20022-participants/src/message_logger.rs",
+      "crates/mx20022-crypto/src/lib.rs",
+      "docs/api/openapi.yaml"
+    ],
+    "outputs_produced": ["Security audit report"],
+    "next_actions": ["Implement fixes for critical and high findings"]
+  },
+  "cross_agent_notes": {
+    "mentions": []
+  }
+}

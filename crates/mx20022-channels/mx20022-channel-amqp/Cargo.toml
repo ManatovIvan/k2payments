@@ -1,0 +1,13 @@
+[package]
+name = "mx20022-channel-amqp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mx20022-channels = { path = "../../mx20022-channels" }
+async-trait.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+lapin = { version = "2.5", default-features = false, features = ["rustls"] }
+futures-util = "0.3"

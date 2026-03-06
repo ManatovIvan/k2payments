@@ -1,0 +1,16 @@
+[package]
+name = "mx20022-store-sqlite"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mx20022-store = { path = "../../mx20022-store" }
+async-trait.workspace = true
+sqlx.workspace = true
+serde_json = "1"
+tracing.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

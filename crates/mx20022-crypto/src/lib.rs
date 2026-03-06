@@ -1,0 +1,115 @@
+use aes_gcm::aead::{Aead, KeyInit};
+use aes_gcm::{Aes256Gcm, Nonce};
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
+use rand::RngCore;
+use sha2::{Digest, Sha256};
+
+#[derive(Debug, Clone)]
+pub struct CryptoService {
+    key_bytes: [u8; 32],
+}
+
+impl CryptoService {
+    pub fn from_master_key(master_key: &str) -> Result<Self, CryptoError> {
+        if master_key.trim().is_empty() {
+            return Err(CryptoError::InvalidMasterKey(
+                "master key must not be empty".to_string(),
+            ));
+        }
+
+        // Derive a fixed-length key for AES-256 from any operator-provided secret.
+        let mut hasher = Sha256::new();
+        hasher.update(master_key.as_bytes());
+        let digest = hasher.finalize();
+
+        let mut key_bytes = [0_u8; 32];
+        key_bytes.copy_from_slice(&digest[..32]);
+
+        Ok(Self { key_bytes })
+    }
+
+    pub fn from_env(var_name: &str) -> Result<Self, CryptoError> {
+        let value =
+            std::env::var(var_name).map_err(|_| CryptoError::MissingEnv(var_name.to_string()))?;
+        Self::from_master_key(&value)
+    }
+
+    pub fn encrypt(&self, plaintext: &[u8]) -> Result<EncryptedBlob, CryptoError> {
+        let cipher = Aes256Gcm::new_from_slice(&self.key_bytes)
+            .map_err(|e| CryptoError::Cipher(format!("cipher init failed: {e}")))?;
+
+        let mut nonce_bytes = [0_u8; 12];
+        rand::thread_rng().fill_bytes(&mut nonce_bytes);
+        let nonce = Nonce::from_slice(&nonce_bytes);
+
+        let ciphertext = cipher
+            .encrypt(nonce, plaintext)
+            .map_err(|e| CryptoError::Cipher(format!("encrypt failed: {e}")))?;
+
+        Ok(EncryptedBlob {
+            algorithm: "AES-256-GCM".to_string(),
+            nonce_b64: STANDARD.encode(nonce_bytes),
+            ciphertext_b64: STANDARD.encode(ciphertext),
+        })
+    }
+
+    pub fn decrypt(&self, blob: &EncryptedBlob) -> Result<Vec<u8>, CryptoError> {
+        if blob.algorithm != "AES-256-GCM" {
+            return Err(CryptoError::UnsupportedAlgorithm(blob.algorithm.clone()));
+        }
+
+        let nonce_bytes = STANDARD
+            .decode(&blob.nonce_b64)
+            .map_err(|e| CryptoError::Cipher(format!("nonce decode failed: {e}")))?;
+        if nonce_bytes.len() != 12 {
+            return Err(CryptoError::Cipher("invalid nonce length".to_string()));
+        }
+
+        let ciphertext = STANDARD
+            .decode(&blob.ciphertext_b64)
+            .map_err(|e| CryptoError::Cipher(format!("ciphertext decode failed: {e}")))?;
+
+        let cipher = Aes256Gcm::new_from_slice(&self.key_bytes)
+            .map_err(|e| CryptoError::Cipher(format!("cipher init failed: {e}")))?;
+
+        cipher
+            .decrypt(Nonce::from_slice(&nonce_bytes), ciphertext.as_ref())
+            .map_err(|e| CryptoError::Cipher(format!("decrypt failed: {e}")))
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct EncryptedBlob {
+    pub algorithm: String,
+    pub nonce_b64: String,
+    pub ciphertext_b64: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum CryptoError {
+    #[error("missing environment variable: {0}")]
+    MissingEnv(String),
+    #[error("invalid master key: {0}")]
+    InvalidMasterKey(String),
+    #[error("unsupported algorithm: {0}")]
+    UnsupportedAlgorithm(String),
+    #[error("cipher error: {0}")]
+    Cipher(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::CryptoService;
+
+    #[test]
+    fn encrypt_decrypt_roundtrip() {
+        let crypto = CryptoService::from_master_key("test-master-key").expect("crypto should init");
+
+        let plaintext = b"secret-payment-field";
+        let blob = crypto.encrypt(plaintext).expect("encrypt should work");
+        let roundtrip = crypto.decrypt(&blob).expect("decrypt should work");
+
+        assert_eq!(roundtrip, plaintext);
+    }
+}

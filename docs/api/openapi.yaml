@@ -1,0 +1,110 @@
+openapi: 3.1.0
+info:
+  title: mx20022-runtime Admin API
+  version: 0.1.0
+servers:
+  - url: http://127.0.0.1:9090
+paths:
+  /health:
+    get:
+      operationId: getHealth
+      responses:
+        '200':
+          description: process is alive
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+  /ready:
+    get:
+      operationId: getReady
+      responses:
+        '200':
+          description: instance ready
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReadyResponse'
+        '503':
+          description: dependencies unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReadyResponse'
+  /status:
+    get:
+      operationId: getStatus
+      responses:
+        '200':
+          description: runtime status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+  /tx/{txId}:
+    get:
+      operationId: getTransactionById
+      parameters:
+        - name: txId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: transaction record
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransactionResponse'
+        '404':
+          description: not found
+components:
+  schemas:
+    HealthResponse:
+      type: object
+      required: [ok]
+      properties:
+        ok:
+          type: boolean
+    ReadyResponse:
+      type: object
+      required: [ready, details]
+      properties:
+        ready:
+          type: boolean
+        details:
+          type: string
+    StatusResponse:
+      type: object
+      required: [runtime, pipelines, channels, store]
+      properties:
+        runtime:
+          type: string
+        pipelines:
+          type: array
+          items:
+            type: string
+        channels:
+          type: array
+          items:
+            type: string
+        store:
+          type: string
+    TransactionResponse:
+      type: object
+      required: [tx_id, pipeline, message_type, state]
+      properties:
+        tx_id:
+          type: string
+        pipeline:
+          type: string
+        message_type:
+          type: string
+        state:
+          type: string
+        received_at:
+          type: string
+        completed_at:
+          type: string
+          nullable: true

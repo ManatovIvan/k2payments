@@ -1,0 +1,281 @@
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use mx20022_channels::{
+    ChannelError, ChannelHealth, DeliveryReceipt, InboundChannel, InboundMessage, OutboundChannel,
+    OutboundMessage,
+};
+use tokio::sync::{mpsc, Mutex};
+use tokio_stream::wrappers::TcpListenerStream;
+use tonic::transport::{Channel, Endpoint, Server};
+use tonic::{Request, Response, Status};
+
+pub mod proto {
+    tonic::include_proto!("mx20022.runtime.channel.grpc.v1");
+}
+
+#[derive(Clone)]
+pub struct GrpcInboundConfig {
+    pub name: String,
+    pub bind: String,
+}
+
+#[derive(Clone)]
+pub struct GrpcInboundChannel {
+    config: GrpcInboundConfig,
+    paused: Arc<AtomicBool>,
+    shutdown: Arc<AtomicBool>,
+}
+
+impl GrpcInboundChannel {
+    pub fn new(config: GrpcInboundConfig) -> Self {
+        Self {
+            config,
+            paused: Arc::new(AtomicBool::new(false)),
+            shutdown: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub async fn run_with_listener(
+        &self,
+        listener: tokio::net::TcpListener,
+        sender: mpsc::Sender<InboundMessage>,
+    ) -> Result<(), ChannelError> {
+        let service = InboundService {
+            sender,
+            paused: Arc::clone(&self.paused),
+            shutdown: Arc::clone(&self.shutdown),
+        };
+
+        Server::builder()
+            .add_service(proto::runtime_channel_server::RuntimeChannelServer::new(
+                service,
+            ))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .map_err(|e| ChannelError::new(format!("grpc inbound server failed: {e}")))
+    }
+}
+
+#[derive(Clone)]
+struct InboundService {
+    sender: mpsc::Sender<InboundMessage>,
+    paused: Arc<AtomicBool>,
+    shutdown: Arc<AtomicBool>,
+}
+
+#[tonic::async_trait]
+impl proto::runtime_channel_server::RuntimeChannel for InboundService {
+    async fn send_inbound(
+        &self,
+        request: Request<proto::InboundEnvelope>,
+    ) -> Result<Response<proto::DeliveryAck>, Status> {
+        if self.shutdown.load(Ordering::Relaxed) {
+            return Err(Status::unavailable("channel shutting down"));
+        }
+        if self.paused.load(Ordering::Relaxed) {
+            return Err(Status::unavailable("channel paused"));
+        }
+
+        let envelope = request.into_inner();
+        self.sender
+            .send(InboundMessage {
+                raw: envelope.raw,
+                content_type: envelope.content_type,
+            })
+            .await
+            .map_err(|e| Status::internal(format!("failed to enqueue inbound message: {e}")))?;
+
+        Ok(Response::new(proto::DeliveryAck {
+            id: "accepted".to_string(),
+        }))
+    }
+}
+
+#[async_trait]
+impl InboundChannel for GrpcInboundChannel {
+    fn name(&self) -> &str {
+        &self.config.name
+    }
+
+    async fn run(&self, sender: mpsc::Sender<InboundMessage>) -> Result<(), ChannelError> {
+        let socket: SocketAddr = self.config.bind.parse().map_err(|e| {
+            ChannelError::new(format!("invalid grpc bind {}: {e}", self.config.bind))
+        })?;
+
+        let service = InboundService {
+            sender,
+            paused: Arc::clone(&self.paused),
+            shutdown: Arc::clone(&self.shutdown),
+        };
+
+        Server::builder()
+            .add_service(proto::runtime_channel_server::RuntimeChannelServer::new(
+                service,
+            ))
+            .serve(socket)
+            .await
+            .map_err(|e| ChannelError::new(format!("grpc inbound server failed: {e}")))
+    }
+
+    async fn shutdown(&self) -> Result<(), ChannelError> {
+        self.shutdown.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
+    async fn health(&self) -> Result<ChannelHealth, ChannelError> {
+        Ok(ChannelHealth {
+            ok: !self.shutdown.load(Ordering::Relaxed),
+            message: Some(if self.paused.load(Ordering::Relaxed) {
+                "paused".to_string()
+            } else {
+                "ok".to_string()
+            }),
+        })
+    }
+
+    async fn pause(&self) -> Result<(), ChannelError> {
+        self.paused.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
+    async fn resume(&self) -> Result<(), ChannelError> {
+        self.paused.store(false, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+pub struct GrpcOutboundConfig {
+    pub name: String,
+    pub endpoint: String,
+}
+
+#[derive(Clone)]
+pub struct GrpcOutboundChannel {
+    config: GrpcOutboundConfig,
+    client: Arc<Mutex<Option<proto::runtime_channel_client::RuntimeChannelClient<Channel>>>>,
+    shutdown: Arc<AtomicBool>,
+}
+
+impl GrpcOutboundChannel {
+    pub fn new(config: GrpcOutboundConfig) -> Self {
+        Self {
+            config,
+            client: Arc::new(Mutex::new(None)),
+            shutdown: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    async fn client(
+        &self,
+    ) -> Result<proto::runtime_channel_client::RuntimeChannelClient<Channel>, ChannelError> {
+        let mut guard = self.client.lock().await;
+        if let Some(client) = guard.as_ref() {
+            return Ok(client.clone());
+        }
+
+        let endpoint = Endpoint::from_shared(self.config.endpoint.clone())
+            .map_err(|e| ChannelError::new(format!("invalid grpc endpoint: {e}")))?;
+        let channel = endpoint
+            .connect()
+            .await
+            .map_err(|e| ChannelError::new(format!("failed grpc connect: {e}")))?;
+        let client = proto::runtime_channel_client::RuntimeChannelClient::new(channel);
+        *guard = Some(client.clone());
+        Ok(client)
+    }
+}
+
+#[async_trait]
+impl OutboundChannel for GrpcOutboundChannel {
+    fn name(&self) -> &str {
+        &self.config.name
+    }
+
+    async fn send(&self, msg: OutboundMessage) -> Result<DeliveryReceipt, ChannelError> {
+        if self.shutdown.load(Ordering::Relaxed) {
+            return Err(ChannelError::new("channel is shut down"));
+        }
+
+        let mut client = self.client().await?;
+        let response = client
+            .send_inbound(Request::new(proto::InboundEnvelope {
+                raw: msg.raw,
+                content_type: msg.content_type,
+            }))
+            .await
+            .map_err(|e| ChannelError::new(format!("grpc send failed: {e}")))?;
+
+        Ok(DeliveryReceipt {
+            id: response.into_inner().id,
+        })
+    }
+
+    async fn shutdown(&self) -> Result<(), ChannelError> {
+        self.shutdown.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
+    async fn health(&self) -> Result<ChannelHealth, ChannelError> {
+        Ok(ChannelHealth {
+            ok: !self.shutdown.load(Ordering::Relaxed),
+            message: Some("ok".to_string()),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use mx20022_channels::{OutboundChannel, OutboundMessage};
+
+    use super::{GrpcInboundChannel, GrpcInboundConfig, GrpcOutboundChannel, GrpcOutboundConfig};
+
+    #[tokio::test]
+    async fn outbound_sends_to_inbound() {
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping grpc outbound/inbound test: {error}");
+                return;
+            }
+            Err(error) => panic!("bind listener: {error}"),
+        };
+        let local_addr = listener.local_addr().expect("local addr");
+        let inbound = GrpcInboundChannel::new(GrpcInboundConfig {
+            name: "grpc-in".to_string(),
+            bind: local_addr.to_string(),
+        });
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let runner = inbound.clone();
+        tokio::spawn(async move {
+            let _ = runner.run_with_listener(listener, tx).await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        let outbound = GrpcOutboundChannel::new(GrpcOutboundConfig {
+            name: "grpc-out".to_string(),
+            endpoint: format!("http://{}", local_addr),
+        });
+
+        let receipt = outbound
+            .send(OutboundMessage {
+                raw: "<Document/>".to_string(),
+                content_type: "application/xml".to_string(),
+            })
+            .await
+            .expect("send should succeed");
+        assert_eq!(receipt.id, "accepted");
+
+        let message = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("should receive inbound")
+            .expect("message should be present");
+        assert_eq!(message.raw, "<Document/>");
+    }
+}

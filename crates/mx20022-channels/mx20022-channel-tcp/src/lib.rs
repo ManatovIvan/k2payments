@@ -1,0 +1,337 @@
+use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use async_trait::async_trait;
+use mx20022_channels::{
+    ChannelError, ChannelHealth, DeliveryReceipt, InboundChannel, InboundMessage, OutboundChannel,
+    OutboundMessage,
+};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc;
+
+#[derive(Debug, Clone, Copy)]
+pub enum TcpFraming {
+    LengthPrefixed,
+    Delimiter(u8),
+}
+
+#[derive(Debug, Clone)]
+pub struct TcpInboundConfig {
+    pub name: String,
+    pub bind: String,
+    pub framing: TcpFraming,
+    pub content_type: String,
+}
+
+#[derive(Clone)]
+pub struct TcpInboundChannel {
+    config: TcpInboundConfig,
+    paused: Arc<AtomicBool>,
+    shutdown: Arc<AtomicBool>,
+}
+
+impl TcpInboundChannel {
+    pub fn new(config: TcpInboundConfig) -> Self {
+        Self {
+            config,
+            paused: Arc::new(AtomicBool::new(false)),
+            shutdown: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+#[async_trait]
+impl InboundChannel for TcpInboundChannel {
+    fn name(&self) -> &str {
+        &self.config.name
+    }
+
+    async fn run(&self, sender: mpsc::Sender<InboundMessage>) -> Result<(), ChannelError> {
+        let listener = TcpListener::bind(&self.config.bind).await.map_err(|e| {
+            ChannelError::new(format!("tcp bind failed on {}: {e}", self.config.bind))
+        })?;
+
+        while !self.shutdown.load(Ordering::Relaxed) {
+            if self.paused.load(Ordering::Relaxed) {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+
+            let (stream, _) = listener
+                .accept()
+                .await
+                .map_err(|e| ChannelError::new(format!("tcp accept failed: {e}")))?;
+
+            let sender = sender.clone();
+            let framing = self.config.framing;
+            let content_type = self.config.content_type.clone();
+            tokio::spawn(async move {
+                if let Err(error) = process_connection(stream, framing, content_type, sender).await
+                {
+                    tracing::warn!(error = %error, "tcp inbound connection failed");
+                }
+            });
+        }
+
+        Ok(())
+    }
+
+    async fn shutdown(&self) -> Result<(), ChannelError> {
+        self.shutdown.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
+    async fn health(&self) -> Result<ChannelHealth, ChannelError> {
+        Ok(ChannelHealth {
+            ok: !self.shutdown.load(Ordering::Relaxed),
+            message: Some(if self.paused.load(Ordering::Relaxed) {
+                "paused".to_string()
+            } else {
+                "ok".to_string()
+            }),
+        })
+    }
+
+    async fn pause(&self) -> Result<(), ChannelError> {
+        self.paused.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
+    async fn resume(&self) -> Result<(), ChannelError> {
+        self.paused.store(false, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TcpOutboundConfig {
+    pub name: String,
+    pub endpoint: String,
+    pub framing: TcpFraming,
+    pub content_type: String,
+}
+
+#[derive(Clone)]
+pub struct TcpOutboundChannel {
+    config: TcpOutboundConfig,
+    shutdown: Arc<AtomicBool>,
+}
+
+impl TcpOutboundChannel {
+    pub fn new(config: TcpOutboundConfig) -> Self {
+        Self {
+            config,
+            shutdown: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+#[async_trait]
+impl OutboundChannel for TcpOutboundChannel {
+    fn name(&self) -> &str {
+        &self.config.name
+    }
+
+    async fn send(&self, msg: OutboundMessage) -> Result<DeliveryReceipt, ChannelError> {
+        if self.shutdown.load(Ordering::Relaxed) {
+            return Err(ChannelError::new("channel is shut down"));
+        }
+
+        let mut stream = TcpStream::connect(&self.config.endpoint)
+            .await
+            .map_err(|e| ChannelError::new(format!("tcp connect failed: {e}")))?;
+
+        write_frame(&mut stream, self.config.framing, msg.raw.as_bytes())
+            .await
+            .map_err(|e| ChannelError::new(format!("tcp send failed: {e}")))?;
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_else(|_| Duration::from_secs(0))
+            .as_millis();
+        Ok(DeliveryReceipt {
+            id: format!("tcp-{now}"),
+        })
+    }
+
+    async fn shutdown(&self) -> Result<(), ChannelError> {
+        self.shutdown.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
+    async fn health(&self) -> Result<ChannelHealth, ChannelError> {
+        Ok(ChannelHealth {
+            ok: !self.shutdown.load(Ordering::Relaxed),
+            message: Some(format!("content_type={}", self.config.content_type)),
+        })
+    }
+}
+
+async fn process_connection(
+    stream: TcpStream,
+    framing: TcpFraming,
+    content_type: String,
+    sender: mpsc::Sender<InboundMessage>,
+) -> Result<(), ChannelError> {
+    match framing {
+        TcpFraming::LengthPrefixed => {
+            let mut stream = stream;
+            loop {
+                let frame = read_length_prefixed(&mut stream).await?;
+                sender
+                    .send(InboundMessage {
+                        raw: String::from_utf8_lossy(&frame).to_string(),
+                        content_type: content_type.clone(),
+                    })
+                    .await
+                    .map_err(|e| ChannelError::new(format!("inbound queue send failed: {e}")))?;
+            }
+        }
+        TcpFraming::Delimiter(delimiter) => {
+            let mut reader = BufReader::new(stream);
+            loop {
+                let mut buf = Vec::new();
+                let bytes = reader
+                    .read_until(delimiter, &mut buf)
+                    .await
+                    .map_err(|e| ChannelError::new(format!("tcp read_until failed: {e}")))?;
+                if bytes == 0 {
+                    return Ok(());
+                }
+
+                if buf.last().copied() == Some(delimiter) {
+                    let _ = buf.pop();
+                }
+                sender
+                    .send(InboundMessage {
+                        raw: String::from_utf8_lossy(&buf).to_string(),
+                        content_type: content_type.clone(),
+                    })
+                    .await
+                    .map_err(|e| ChannelError::new(format!("inbound queue send failed: {e}")))?;
+            }
+        }
+    }
+}
+
+async fn read_length_prefixed(stream: &mut TcpStream) -> Result<Vec<u8>, ChannelError> {
+    let mut header = [0_u8; 4];
+    stream
+        .read_exact(&mut header)
+        .await
+        .map_err(to_channel_read_error)?;
+    let len = u32::from_be_bytes(header) as usize;
+    if len == 0 {
+        return Err(ChannelError::new("invalid zero-length tcp frame"));
+    }
+
+    let mut payload = vec![0_u8; len];
+    stream
+        .read_exact(&mut payload)
+        .await
+        .map_err(to_channel_read_error)?;
+    Ok(payload)
+}
+
+async fn write_frame(
+    stream: &mut TcpStream,
+    framing: TcpFraming,
+    payload: &[u8],
+) -> Result<(), io::Error> {
+    match framing {
+        TcpFraming::LengthPrefixed => {
+            let len = u32::try_from(payload.len()).unwrap_or(u32::MAX);
+            stream.write_all(&len.to_be_bytes()).await?;
+            stream.write_all(payload).await?;
+        }
+        TcpFraming::Delimiter(delimiter) => {
+            stream.write_all(payload).await?;
+            stream.write_all(&[delimiter]).await?;
+        }
+    }
+    stream.flush().await?;
+    Ok(())
+}
+
+fn to_channel_read_error(error: io::Error) -> ChannelError {
+    if error.kind() == io::ErrorKind::UnexpectedEof {
+        ChannelError::new("tcp connection closed")
+    } else {
+        ChannelError::new(format!("tcp read failed: {error}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use mx20022_channels::{InboundChannel, OutboundChannel, OutboundMessage};
+
+    use super::{
+        TcpFraming, TcpInboundChannel, TcpInboundConfig, TcpOutboundChannel, TcpOutboundConfig,
+    };
+
+    fn find_available_port() -> Option<u16> {
+        match std::net::TcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => {
+                let port = listener.local_addr().ok().map(|addr| addr.port());
+                drop(listener);
+                port
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => None,
+            Err(error) => panic!("bind listener: {error}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn tcp_length_prefixed_roundtrip() {
+        let Some(port) = find_available_port() else {
+            eprintln!("skipping tcp roundtrip test: binding not permitted");
+            return;
+        };
+        let inbound = TcpInboundChannel::new(TcpInboundConfig {
+            name: "tcp-in".to_string(),
+            bind: format!("127.0.0.1:{port}"),
+            framing: TcpFraming::LengthPrefixed,
+            content_type: "application/xml".to_string(),
+        });
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let runner = inbound.clone();
+        tokio::spawn(async move {
+            let _ = runner.run(tx).await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let outbound = TcpOutboundChannel::new(TcpOutboundConfig {
+            name: "tcp-out".to_string(),
+            endpoint: format!("127.0.0.1:{port}"),
+            framing: TcpFraming::LengthPrefixed,
+            content_type: "application/xml".to_string(),
+        });
+        let send_result = outbound
+            .send(OutboundMessage {
+                raw: "<Document/>".to_string(),
+                content_type: "application/xml".to_string(),
+            })
+            .await;
+        if let Err(error) = send_result {
+            let message = error.to_string();
+            if message.contains("Operation not permitted") || message.contains("Permission denied")
+            {
+                eprintln!("skipping tcp roundtrip test: {message}");
+                return;
+            }
+            panic!("tcp outbound should send: {message}");
+        }
+
+        let message = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("message should be received")
+            .expect("message must exist");
+        assert_eq!(message.raw, "<Document/>");
+    }
+}

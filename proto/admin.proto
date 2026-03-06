@@ -1,0 +1,40 @@
+syntax = "proto3";
+
+package mx20022.runtime.admin.v1;
+import "google/protobuf/empty.proto";
+
+message HealthResponse {
+  bool ok = 1;
+}
+
+message ReadyResponse {
+  bool ready = 1;
+  string details = 2;
+}
+
+message StatusResponse {
+  string runtime = 1;
+  repeated string pipelines = 2;
+  repeated string channels = 3;
+  string store = 4;
+}
+
+message GetTransactionRequest {
+  string tx_id = 1;
+}
+
+message TransactionResponse {
+  string tx_id = 1;
+  string pipeline = 2;
+  string message_type = 3;
+  string state = 4;
+  string received_at = 5;
+  string completed_at = 6;
+}
+
+service AdminService {
+  rpc GetHealth(google.protobuf.Empty) returns (HealthResponse);
+  rpc GetReady(google.protobuf.Empty) returns (ReadyResponse);
+  rpc GetStatus(google.protobuf.Empty) returns (StatusResponse);
+  rpc GetTransaction(GetTransactionRequest) returns (TransactionResponse);
+}

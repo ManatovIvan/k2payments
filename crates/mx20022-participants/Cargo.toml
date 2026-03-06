@@ -1,0 +1,17 @@
+[package]
+name = "mx20022-participants"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mx20022-runtime-core = { path = "../mx20022-runtime-core" }
+mx20022-parse.workspace = true
+mx20022-validate.workspace = true
+mx20022-model.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+regex = "1"
+
+[dev-dependencies]
+tokio.workspace = true

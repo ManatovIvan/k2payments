@@ -1,0 +1,25 @@
+[runtime]
+name = "example"
+instance_id = "local-01"
+log_level = "info"
+metrics_bind = "0.0.0.0:9100"
+admin_bind = "127.0.0.1:9090"
+
+[store]
+backend = "sqlite"
+url = "sqlite::memory:"
+
+[channels.http-in]
+type = "http"
+mode = "server"
+bind = "0.0.0.0:8443"
+content_type = "application/xml"
+
+[[pipeline]]
+name = "demo"
+channel_in = "http-in"
+message_types = ["pacs.008"]
+max_concurrent = 100
+participants = [
+  { name = "message-logger", config = {} },
+]

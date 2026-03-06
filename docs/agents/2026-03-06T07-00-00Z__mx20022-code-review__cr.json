@@ -1,0 +1,68 @@
+{
+  "metadata": {
+    "task_short": "mx20022-code-review",
+    "agent_abbr": "cr",
+    "datetime_utc": "2026-03-06T07:00:00Z",
+    "filename": "2026-03-06T07-00-00Z__mx20022-code-review__cr.json",
+    "supersedes": null,
+    "version": "1.0"
+  },
+  "state": {
+    "objectives": [
+      "Review 15 source files in mx20022-runtime Rust workspace for code quality and maintainability"
+    ],
+    "constraints": [
+      "No code changes — review only",
+      "Keep changes minimal and auditable per CLAUDE.md"
+    ],
+    "important_facts": [
+      "Workspace: 15 crates, Rust 2021 edition",
+      "mx20022-store-sqlite recently rewritten from rusqlite to sqlx with async pool + OnceCell",
+      "No unsafe code found across all reviewed files",
+      "Key issues: duplicate encode_time(), query() does in-process filtering, ensure_initialized() auto-migrates in production, hardcoded bearer-token check, mpsc queue depth magic number 1024, commit phase missing success ParticipantResult entries"
+    ],
+    "decisions_made": [
+      "Classified duplicate encode_time as HIGH (3 copies across service.rs, lib.rs, main.rs)",
+      "Classified auto-migration in ensure_initialized as CRITICAL for production deployments",
+      "Classified in-process query filtering as CRITICAL for scalability at payment volumes",
+      "Classified hardcoded 'readonly' token logic as CRITICAL security issue"
+    ],
+    "artifacts": [
+      "/Volumes/Everything/Development/k2payments/crates/mx20022-runtime-core/src/transaction_manager.rs",
+      "/Volumes/Everything/Development/k2payments/crates/mx20022-runtime-core/src/context.rs",
+      "/Volumes/Everything/Development/k2payments/crates/mx20022-store/mx20022-store-sqlite/src/lib.rs",
+      "/Volumes/Everything/Development/k2payments/crates/mx20022-runtime/src/engine.rs",
+      "/Volumes/Everything/Development/k2payments/crates/mx20022-admin/src/http.rs",
+      "/Volumes/Everything/Development/k2payments/crates/mx20022-admin/src/host.rs",
+      "/Volumes/Everything/Development/k2payments/crates/mx20022-cli/src/main.rs"
+    ],
+    "dependencies": [],
+    "risks_issues": [
+      "Auto-migration in ensure_initialized bypasses deployment controls: OPEN",
+      "query() filters in Rust rather than SQL — will not scale: OPEN",
+      "Hardcoded bearer token value 'readonly' in authorization logic: OPEN",
+      "commit phase does not record successful ParticipantResult entries: OPEN",
+      "pool_size config field is parsed but never passed to SqlitePool: OPEN"
+    ]
+  },
+  "iteration": {
+    "summary": "Performed full code review of 15 source files in the mx20022-runtime Rust workspace. No unsafe code was found. The core 2PC transaction manager, state machine, and context map are well-designed. The main concerns are: (1) ensure_initialized() silently auto-runs migrations on every cold start, which is dangerous in production; (2) the Store::query() implementation fetches all rows then filters in Rust, which will not scale; (3) authorization logic contains a hardcoded 'readonly' bearer token value duplicated across http.rs and host.rs; (4) encode_time() is copy-pasted into three separate files; (5) the mpsc channel depth of 1024 is a magic number with no documentation; (6) pool_size config is parsed but silently ignored. The codebase is otherwise clean with good error propagation and consistent idioms.",
+    "inputs_consulted": [
+      "All 15 files listed in task description"
+    ],
+    "outputs_produced": [
+      "Structured code review report (this response)"
+    ],
+    "next_actions": [
+      "Move encode_time into a shared mx20022-time utility crate or module",
+      "Push SQL filtering into WHERE clauses in query()",
+      "Separate ensure_initialized from apply_migrations — do not auto-migrate in production",
+      "Replace hardcoded 'readonly' token check with proper RBAC or at minimum a configurable value",
+      "Document the 1024 mpsc bound or make it configurable via PipelineSection",
+      "Wire pool_size config to SqlitePool builder"
+    ]
+  },
+  "cross_agent_notes": {
+    "mentions": []
+  }
+}

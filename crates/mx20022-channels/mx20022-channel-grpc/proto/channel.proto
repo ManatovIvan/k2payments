@@ -1,0 +1,16 @@
+syntax = "proto3";
+
+package mx20022.runtime.channel.grpc.v1;
+
+message InboundEnvelope {
+  string raw = 1;
+  string content_type = 2;
+}
+
+message DeliveryAck {
+  string id = 1;
+}
+
+service RuntimeChannel {
+  rpc SendInbound(InboundEnvelope) returns (DeliveryAck);
+}

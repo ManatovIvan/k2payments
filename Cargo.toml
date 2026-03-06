@@ -1,0 +1,52 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/mx20022-runtime-core",
+  "crates/mx20022-channels",
+  "crates/mx20022-channels/mx20022-channel-http",
+  "crates/mx20022-channels/mx20022-channel-grpc",
+  "crates/mx20022-channels/mx20022-channel-kafka",
+  "crates/mx20022-channels/mx20022-channel-amqp",
+  "crates/mx20022-channels/mx20022-channel-file",
+  "crates/mx20022-channels/mx20022-channel-nats",
+  "crates/mx20022-channels/mx20022-channel-tcp",
+  "crates/mx20022-participants",
+  "crates/mx20022-store",
+  "crates/mx20022-store/mx20022-store-postgres",
+  "crates/mx20022-store/mx20022-store-sqlite",
+  "crates/mx20022-store/mx20022-store-rocksdb",
+  "crates/mx20022-correlation",
+  "crates/mx20022-session",
+  "crates/mx20022-config",
+  "crates/mx20022-metrics",
+  "crates/mx20022-admin",
+  "crates/mx20022-crypto",
+  "crates/mx20022-cli",
+  "crates/mx20022-runtime",
+]
+
+[workspace.package]
+version = "0.1.0-alpha.1"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/mx20022-rs/mx20022-runtime"
+
+[workspace.dependencies]
+anyhow = "1"
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+axum = "0.7"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "json"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "sqlite", "postgres"] }
+tonic = { version = "0.12", features = ["transport"] }
+prost = "0.13"
+prost-types = "0.13"
+mx20022-parse = "0.1.1"
+mx20022-validate = "0.1.1"
+mx20022-model = "0.1.1"

@@ -1,0 +1,49 @@
+[package]
+name = "mx20022-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "mxruntime"
+path = "src/main.rs"
+
+[dependencies]
+mx20022-runtime-core = { path = "../mx20022-runtime-core" }
+mx20022-channels = { path = "../mx20022-channels" }
+mx20022-channel-http = { path = "../mx20022-channels/mx20022-channel-http" }
+mx20022-channel-grpc = { path = "../mx20022-channels/mx20022-channel-grpc" }
+mx20022-channel-file = { path = "../mx20022-channels/mx20022-channel-file" }
+mx20022-channel-tcp = { path = "../mx20022-channels/mx20022-channel-tcp" }
+mx20022-channel-nats = { path = "../mx20022-channels/mx20022-channel-nats" }
+mx20022-channel-kafka = { path = "../mx20022-channels/mx20022-channel-kafka" }
+mx20022-channel-amqp = { path = "../mx20022-channels/mx20022-channel-amqp" }
+mx20022-store = { path = "../mx20022-store" }
+mx20022-store-sqlite = { path = "../mx20022-store/mx20022-store-sqlite" }
+mx20022-store-postgres = { path = "../mx20022-store/mx20022-store-postgres" }
+mx20022-store-rocksdb = { path = "../mx20022-store/mx20022-store-rocksdb" }
+mx20022-participants = { path = "../mx20022-participants" }
+mx20022-config = { path = "../mx20022-config" }
+mx20022-admin = { path = "../mx20022-admin" }
+mx20022-metrics = { path = "../mx20022-metrics" }
+mx20022-correlation = { path = "../mx20022-correlation" }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+
+[features]
+default = ["channel-http", "channel-grpc", "store-postgres", "store-sqlite"]
+channel-http = []
+channel-grpc = []
+channel-kafka = []
+channel-amqp = []
+channel-file = []
+channel-nats = []
+channel-tcp = []
+store-postgres = []
+store-sqlite = []
+store-rocksdb = []
+all-channels = ["channel-http", "channel-grpc", "channel-kafka", "channel-amqp", "channel-file", "channel-nats", "channel-tcp"]
+all-stores = ["store-postgres", "store-sqlite", "store-rocksdb"]
+full = ["all-channels", "all-stores"]

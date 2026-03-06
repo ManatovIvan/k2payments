@@ -1,0 +1,20 @@
+[package]
+name = "mx20022-channel-grpc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mx20022-channels = { path = "../../mx20022-channels" }
+async-trait.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tracing.workspace = true
+tonic.workspace = true
+prost.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+
+[build-dependencies]
+tonic-build = "0.12"
