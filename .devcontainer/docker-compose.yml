@@ -1,0 +1,83 @@
+version: "3.8"
+
+services:
+  app:
+    build:
+      context: ..
+      dockerfile: .devcontainer/Dockerfile
+    volumes:
+      - ..:/workspaces/k2payments:cached
+    command: sleep infinity
+    environment:
+      RUST_LOG: info
+    depends_on:
+      - postgres
+      - nats
+      - rabbitmq
+      - kafka
+    networks:
+      - k2net
+
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: k2
+      POSTGRES_PASSWORD: k2
+      POSTGRES_DB: k2payments
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - k2net
+
+  nats:
+    image: nats:2
+    restart: unless-stopped
+    ports:
+      - "4222:4222"
+    networks:
+      - k2net
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    restart: unless-stopped
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    networks:
+      - k2net
+
+  zookeeper:
+    image: bitnami/zookeeper:3.9
+    restart: unless-stopped
+    environment:
+      ALLOW_ANONYMOUS_LOGIN: "yes"
+    ports:
+      - "2181:2181"
+    networks:
+      - k2net
+
+  kafka:
+    image: bitnami/kafka:3.6
+    restart: unless-stopped
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_CFG_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_CFG_LISTENERS: PLAINTEXT://:9092
+      KAFKA_CFG_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      ALLOW_PLAINTEXT_LISTENER: "yes"
+    ports:
+      - "9092:9092"
+    depends_on:
+      - zookeeper
+    networks:
+      - k2net
+
+volumes:
+  postgres-data:
+
+networks:
+  k2net:
+    driver: bridge
