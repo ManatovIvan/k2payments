@@ -1,0 +1,32 @@
+[runtime]
+name = "quickstart"
+instance_id = "local-quickstart"
+log_level = "info"
+admin_bind = "127.0.0.1:19090"
+recover_incomplete_on_startup = true
+
+[runtime.admin_auth]
+mode = "disabled"
+
+[store]
+backend = "sqlite"
+url = "sqlite:///tmp/mx20022-quickstart.db"
+
+[channels.http-in]
+type = "http"
+mode = "server"
+bind = "127.0.0.1:18080"
+content_type = "application/xml"
+auth_mode = "disabled"
+allow_plaintext = true
+
+[[pipeline]]
+name = "demo"
+channel_in = "http-in"
+message_types = ["pacs.008"]
+max_concurrent = 100
+participants = [
+  { name = "message-logger" },
+  { name = "schema-validator" },
+  { name = "status-response-builder", config = { auto_pacs002 = true } },
+]
