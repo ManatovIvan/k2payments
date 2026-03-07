@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- New root documentation set:
+  - `README.md` rewritten with actionable setup/run/ops guidance.
+  - `contributor.md` with contributor workflow, quality gates, and PR checklist.
+  - `architecture.md` with current runtime architecture, boundaries, and tradeoffs.
+- `docs/QUICKSTART.md` for fast local bring-up and verification.
+- `docs/examples/quickstart.toml` minimal local development config (HTTP ingress + admin + SQLite file store).
+- Runtime benchmark harness (`criterion`) and `runtime_hot_paths` bench covering `RuntimeApp::process` and store query hot paths.
+- Additional adapter tests for HTTP, Kafka, NATS, and AMQP channels (inbound/outbound lifecycle behavior).
 - Configurable admin security policies: `disabled`, `legacy_bearer`, and `jwt_hs256` modes with per-endpoint RBAC role requirements.
 - JWT and static bearer authentication support for HTTP/gRPC inbound channels (`auth_mode` + auth policy fields).
 - Optional mTLS subject checks for admin and channel ingress using forwarded client-certificate subject headers.
@@ -20,6 +28,10 @@ All notable changes to this project will be documented in this file.
 - Added `mxctl channel list` command (HTTP/gRPC admin-backed channel inventory).
 
 ### Changed
+- Participant construction in runtime app moved from a monolithic match block to a registry-based builder pattern.
+- Runtime request handling now uses a unified `TransactionRecord`-backed request model to reduce schema drift and mapping overhead.
+- Kafka inbound offset commits now use explicit synchronous manual commit after enqueue (`enable.auto.commit=false` + sync commit).
+- Kafka channel configs now support secure transport client properties (`security_protocol`, `ssl_ca_location`) and runtime wiring passes them through.
 - Admin HTTP/gRPC `ready`, `status`, and `tx` routes now enforce a unified auth policy engine instead of ad-hoc token checks.
 - Runtime config now validates `runtime.admin_auth` settings and rejects invalid JWT auth declarations at startup.
 - Runtime participant registry now supports PRD flow-control and scheme-specific participant names/config blocks.
@@ -34,7 +46,9 @@ All notable changes to this project will be documented in this file.
 
 ### Tested
 - `cargo fmt --all`
+- `cargo clippy --workspace --all-targets -- -D warnings`
 - `cargo test --workspace`
+- `cargo bench -p mx20022-runtime --no-run`
 
 ## [0.1.0-alpha.1] - 2026-03-05
 

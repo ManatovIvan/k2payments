@@ -112,6 +112,7 @@ Start from:
 
 ## Operational Docs
 
+- `docs/QUICKSTART.md`: fastest path to local runtime bring-up
 - `architecture.md` (root): engineering architecture reference
 - `contributor.md` (root): contributor workflow and standards
 - `docs/OPERATIONS.md`: operator runbook
