@@ -1,7 +1,7 @@
-/// Missing high-value tests for mx20022-runtime-core.
+/// High-value regression tests for mx20022-runtime-core.
 ///
-/// NOT wired into the build yet.  Add `#[cfg(test)] mod tests_missing;` to
-/// lib.rs when ready.
+/// This module focuses on two-phase-commit poison paths, state-machine
+/// transition invariants, and context type-safety behavior.
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
