@@ -1,3 +1,6 @@
+// Copyright (C) 2026 mx20022-runtime contributors
+// SPDX-License-Identifier: AGPL-3.0-only
+
 use once_cell::sync::Lazy;
 use prometheus::{
     Encoder, HistogramOpts, HistogramVec, IntCounterVec, IntGaugeVec, Registry, TextEncoder,

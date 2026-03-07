@@ -1,3 +1,6 @@
+// Copyright (C) 2026 mx20022-runtime contributors
+// SPDX-License-Identifier: AGPL-3.0-only
+
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
 use base64::engine::general_purpose::STANDARD;

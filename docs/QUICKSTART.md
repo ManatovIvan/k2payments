@@ -1,15 +1,16 @@
-# Quick Start
+# Quick Start (Under 10 Minutes)
 
-This guide gets you from clone to a running local runtime in a few minutes.
+This guide takes you from clone to processing your first `pacs.008` end to end.
 
-It uses a development config with:
+It uses local-only defaults:
 
-- local HTTP inbound channel (`127.0.0.1:18080`)
-- local admin HTTP host (`127.0.0.1:19090`)
-- SQLite file store (`/tmp/mx20022-quickstart.db`)
-- auth disabled for local-only testing
+- inbound HTTP channel: `127.0.0.1:18080`
+- admin HTTP host: `127.0.0.1:19090`
+- SQLite store: `/tmp/mx20022-quickstart.db`
+- auth disabled for local testing
 
-Config file: `docs/examples/quickstart.toml`
+Config: `docs/examples/quickstart.toml`
+Message sample: `docs/examples/messages/pacs008-minimal.xml`
 
 ## 1. Build
 
@@ -31,7 +32,7 @@ cargo run -p mx20022-runtime -- --config docs/examples/quickstart.toml --serve-a
 
 Keep this terminal running.
 
-## 4. Verify health/admin
+## 4. Verify runtime is up
 
 In a second terminal:
 
@@ -41,17 +42,17 @@ curl -s http://127.0.0.1:19090/ready
 curl -s http://127.0.0.1:19090/status
 ```
 
-## 5. Send a test message
+## 5. Send your first `pacs.008`
 
 ```bash
 curl -i -X POST http://127.0.0.1:18080/ \
   -H 'content-type: application/xml' \
-  --data '<Document><Msg>Hello</Msg></Document>'
+  --data-binary @docs/examples/messages/pacs008-minimal.xml
 ```
 
 Expected: `202 Accepted`.
 
-## 6. Verify transaction persisted
+## 6. Verify it was processed through pipeline
 
 ```bash
 cargo run -p mx20022-cli -- tx search \
@@ -60,9 +61,9 @@ cargo run -p mx20022-cli -- tx search \
   --limit 10
 ```
 
-You should see transactions in terminal states (typically `COMMITTED` for the happy path).
+You should see a transaction for the submitted message in a terminal state (typically `COMMITTED`).
 
-## 7. View metrics
+## 7. Check metrics
 
 ```bash
 curl -s http://127.0.0.1:19090/metrics | head -n 30
@@ -72,14 +73,14 @@ curl -s http://127.0.0.1:19090/metrics | head -n 30
 
 Press `Ctrl+C` in the runtime terminal.
 
-## Useful follow-ups
+## Next docs
 
-- Full ops runbook: `docs/OPERATIONS.md`
-- Contributor workflow: `contributor.md`
-- Architecture deep dive: `architecture.md`
-- More secure example config: `docs/examples/basic.toml`
+- Ops runbook: `docs/OPERATIONS.md`
+- Participant development: `docs/PARTICIPANT_GUIDE.md`
+- Architecture: `architecture.md`
+- Additional examples: `docs/examples/basic.toml`, `docs/examples/fednow-gateway.toml`, `docs/examples/mt-to-mx-bridge.toml`
 
-## Notes
+## Local-only note
 
-- This quickstart intentionally disables auth and allows plaintext for local use only.
-- Do not use `docs/examples/quickstart.toml` as a production baseline.
+`docs/examples/quickstart.toml` intentionally disables auth and allows plaintext for speed.
+Do not use it as a production baseline.

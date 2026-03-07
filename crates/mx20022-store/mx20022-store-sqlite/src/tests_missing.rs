@@ -1,3 +1,6 @@
+// Copyright (C) 2026 mx20022-runtime contributors
+// SPDX-License-Identifier: AGPL-3.0-only
+
 /// Missing high-value tests for mx20022-store-sqlite.
 ///
 /// This module is wired from `lib.rs` via `mod tests_missing;`.

@@ -1,3 +1,6 @@
+-- Copyright (C) 2026 mx20022-runtime contributors
+-- SPDX-License-Identifier: AGPL-3.0-only
+
 DROP INDEX IF EXISTS idx_expectations_state_timeout;
 DROP INDEX IF EXISTS idx_context_mutations_tx_written;
 DROP INDEX IF EXISTS idx_transactions_state_received;

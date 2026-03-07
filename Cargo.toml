@@ -28,7 +28,7 @@ members = [
 [workspace.package]
 version = "0.1.0-alpha.1"
 edition = "2021"
-license = "Apache-2.0"
+license = "AGPL-3.0-only"
 repository = "https://github.com/mx20022-rs/mx20022-runtime"
 
 [workspace.dependencies]

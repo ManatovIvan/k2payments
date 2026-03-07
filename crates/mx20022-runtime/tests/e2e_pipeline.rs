@@ -1,3 +1,6 @@
+// Copyright (C) 2026 mx20022-runtime contributors
+// SPDX-License-Identifier: AGPL-3.0-only
+
 use mx20022_config::RuntimeConfig;
 use mx20022_runtime::app::RuntimeApp;
 use mx20022_runtime_core::transaction_manager::Outcome;

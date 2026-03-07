@@ -124,6 +124,7 @@ Before opening PR:
 - [ ] `fmt`, `clippy -D warnings`, `test` all pass
 - [ ] New behavior has tests
 - [ ] Docs/config examples updated if needed
+- [ ] CLA is signed (required for external contributors)
 - [ ] Any risk, migration, or rollback notes included in PR description
 
 ## 10. Commit Style

@@ -1,0 +1,84 @@
+# FedNow-style gateway profile (annotated example)
+# This example is intended for technical evaluation and architecture reviews.
+
+[runtime]
+name = "fednow-gateway"
+instance_id = "us-east-1-gw-a"
+log_level = "info"
+metrics_bind = "0.0.0.0:9100"
+admin_bind = "127.0.0.1:9090"
+admin_grpc_bind = "127.0.0.1:9091"
+enforce_secure_channels = true
+correlation_scan_interval_ms = 1000
+participant_reload_poll_ms = 5000
+recover_incomplete_on_startup = true
+recovery_startup_limit = 5000
+
+[runtime.admin_auth]
+mode = "jwt_hs256"
+jwt_hs256_secret = "${MX_ADMIN_JWT_SECRET}"
+jwt_issuer = "mxruntime"
+jwt_audience = "mxruntime-admin"
+ready_roles = ["admin.read", "admin"]
+status_roles = ["admin.read", "admin"]
+tx_roles = ["admin.tx.read", "admin"]
+reload_roles = ["admin.write", "admin"]
+require_mtls_subject = true
+mtls_subject_header = "x-client-cert-subject"
+mtls_allowed_subjects = [
+  "CN=ops-console,O=example-bank",
+  "CN=platform-automation,O=example-bank",
+]
+
+[store]
+backend = "postgres"
+url = "${MX_STORE_URL}"
+pool_size = 32
+retention_days = 14
+
+# Inbound API edge (FedNow-connected gateway or upstream switch)
+[channels.fednow-in]
+type = "http"
+mode = "server"
+bind = "0.0.0.0:8443"
+content_type = "application/xml"
+tls_cert = "${MX_HTTP_TLS_CERT}"
+tls_key = "${MX_HTTP_TLS_KEY}"
+auth_mode = "jwt_hs256"
+auth_jwt_hs256_secret = "${MX_CHANNEL_JWT_SECRET}"
+auth_jwt_issuer = "mxruntime"
+auth_jwt_audience = "mxruntime-channel"
+auth_required_roles = ["channel.ingress"]
+auth_require_mtls_subject = true
+auth_mtls_subject_header = "x-client-cert-subject"
+auth_mtls_allowed_subjects = ["CN=fednow-ingress-gateway,O=example-bank"]
+
+# Outbound connector to downstream clearing/settlement integration
+[channels.fednow-out]
+type = "grpc"
+mode = "client"
+endpoint = "https://fednow-core.internal:9443"
+ca_cert = "${MX_GRPC_CA_CERT}"
+client_cert = "${MX_GRPC_CLIENT_CERT}"
+client_key = "${MX_GRPC_CLIENT_KEY}"
+timeout_ms = 2000
+
+[[pipeline]]
+name = "fednow-credit-transfer"
+description = "Inbound pacs.008 handling with FedNow profile checks"
+channel_in = "fednow-in"
+channel_out = "fednow-out"
+message_types = ["pacs.008"]
+max_concurrent = 1000
+timeout_ms = 5000
+participants = [
+  { name = "duplicate-checker", config = { keys = ["message_id", "uetr"] } },
+  { name = "rate-limiter", config = { rate_per_second = 2000, burst = 4000, scope = "source_channel" } },
+  { name = "schema-validator", config = {} },
+  { name = "fednow-rule-validator", config = {} },
+  { name = "routing-engine", config = { default_route = "fednow-out", rules = [
+    { message_type = "pacs.008", currency = "USD", destination = "fednow-out" }
+  ] } },
+  { name = "status-response-builder", config = { auto_pacs002 = true } },
+  { name = "message-logger", config = { tag = "fednow-gateway" } },
+]

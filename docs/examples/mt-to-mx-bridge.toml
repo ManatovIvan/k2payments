@@ -1,0 +1,62 @@
+# MT-to-MX bridge profile (annotated example)
+# Demonstrates a SWIFT MT103 ingress path transformed to pacs.008 for MX-native processing.
+
+[runtime]
+name = "mt-to-mx-bridge"
+instance_id = "bridge-local-01"
+log_level = "info"
+metrics_bind = "0.0.0.0:9200"
+admin_bind = "127.0.0.1:9190"
+enforce_secure_channels = true
+recover_incomplete_on_startup = true
+
+[runtime.admin_auth]
+mode = "jwt_hs256"
+jwt_hs256_secret = "${MX_ADMIN_JWT_SECRET}"
+jwt_issuer = "mxruntime"
+jwt_audience = "mxruntime-admin"
+
+[store]
+backend = "sqlite"
+url = "sqlite:///tmp/mx20022-bridge.db"
+
+# Inbound MT stream (for example, from an internal SWIFT ingress adapter)
+[channels.mt103-in]
+type = "tcp"
+mode = "server"
+bind = "0.0.0.0:7001"
+tls_enabled = true
+tls_cert = "${MX_TCP_TLS_CERT}"
+tls_key = "${MX_TCP_TLS_KEY}"
+
+# Outbound MX delivery channel (pacs.008 XML)
+[channels.mx-http-out]
+type = "http"
+mode = "client"
+url = "https://mx-switch.internal/payments"
+method = "POST"
+content_type = "application/xml"
+ca_cert = "${MX_HTTP_CA_CERT}"
+client_cert = "${MX_HTTP_CLIENT_CERT}"
+client_key = "${MX_HTTP_CLIENT_KEY}"
+
+[[pipeline]]
+name = "mt103-to-pacs008"
+description = "Bridge MT103 messages into pacs.008 then run standard controls"
+channel_in = "mt103-in"
+channel_out = "mx-http-out"
+message_types = ["mt103", "pacs.008"]
+max_concurrent = 300
+timeout_ms = 8000
+participants = [
+  # Custom participant supplied by integrator. It should parse MT103 and write transformed pacs.008 XML into Context.
+  { name = "swift-mt-to-mx-bridge", config = { input = "mt103", output = "pacs.008.001.13" } },
+
+  # Standard runtime controls continue after transformation.
+  { name = "schema-validator", config = {} },
+  { name = "business-rule-validator", config = { scheme = "cbpr" } },
+  { name = "duplicate-checker", config = { keys = ["message_id", "uetr", "end_to_end_id"] } },
+  { name = "routing-engine", config = { default_route = "mx-http-out" } },
+  { name = "status-response-builder", config = { auto_pacs002 = true } },
+  { name = "message-logger", config = { tag = "mt-mx-bridge" } },
+]

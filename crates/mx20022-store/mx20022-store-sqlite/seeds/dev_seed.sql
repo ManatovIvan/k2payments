@@ -1,3 +1,6 @@
+-- Copyright (C) 2026 mx20022-runtime contributors
+-- SPDX-License-Identifier: AGPL-3.0-only
+
 INSERT INTO transactions (
     tx_id, pipeline, source_channel, message_type, raw_message, state, received_at, completed_at, key_fields_json
 ) VALUES

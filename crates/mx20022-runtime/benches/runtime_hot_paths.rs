@@ -1,3 +1,6 @@
+// Copyright (C) 2026 mx20022-runtime contributors
+// SPDX-License-Identifier: AGPL-3.0-only
+
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 

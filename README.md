@@ -1,144 +1,57 @@
 # mx20022-runtime
 
-`mx20022-runtime` is a modular ISO 20022 payment runtime written in Rust.
+`mx20022-runtime` is a production-focused ISO 20022 payment orchestration runtime written in Rust.
 
-It ingests messages from channel adapters, executes a configurable participant pipeline with transactional lifecycle control, persists all transaction state, and can publish outbound responses.
+It receives financial messages from inbound channels, executes deterministic participant pipelines, persists every transaction state transition, and emits outbound responses or routed deliveries.
 
-## Why This Project
+> `mx20022-runtime` is licensed under **AGPL-3.0-only**. Commercial licensing is available for organizations that need to use this software without AGPL obligations. Contact **licensing@k2payments.com** for details.
+>
+> The `mx20022` core libraries (`mx20022-model`, `mx20022-parse`, `mx20022-validate`) remain separately licensed under **Apache-2.0**.
 
-- Deterministic pipeline processing with explicit lifecycle states (`RECEIVED` → `PREPARING` → ...).
-- Pluggable channels (HTTP, gRPC, TCP, Kafka, NATS, AMQP, file) behind shared traits.
-- Pluggable stores (SQLite, Postgres, RocksDB).
-- Admin plane (HTTP + gRPC) with status/reload/tx inspection.
-- Correlation engine for expectation matching and timeout handling.
+## Why this runtime
 
-## Workspace Layout
+- Deterministic transaction lifecycle with auditable state transitions.
+- Pluggable transport channels: HTTP, gRPC, TCP, Kafka, NATS, AMQP, file.
+- Pluggable state stores: SQLite, Postgres, RocksDB.
+- Built-in participant chain for schema, duplicate, routing, rules, and response handling.
+- Admin plane (HTTP + gRPC), metrics, correlation, and runtime reload controls.
 
-This is a Rust workspace (`22` crates) with clear crate boundaries:
-
-- `crates/mx20022-runtime`: app wiring + runtime binary (`mxruntime`)
-- `crates/mx20022-runtime-core`: context, participant trait, state machine, transaction manager
-- `crates/mx20022-channels/*`: channel adapters
-- `crates/mx20022-participants`: built-in participant implementations
-- `crates/mx20022-store/*`: storage abstraction + backends
-- `crates/mx20022-admin`: admin host/services/auth
-- `crates/mx20022-config`: TOML parse + validation
-- `crates/mx20022-correlation`: expectation/correlation engine
-- `crates/mx20022-cli`: operator CLI (`mxctl`)
-
-## Quick Start
-
-### 1. Prerequisites
-
-- Rust stable toolchain
-- `cargo`
-- `just` (optional, but convenient)
-
-### 2. Build
+## Try it in under 10 minutes
 
 ```bash
 cargo build --workspace
+cargo run -p mx20022-cli -- config validate docs/examples/quickstart.toml
+cargo run -p mx20022-runtime -- --config docs/examples/quickstart.toml --serve-admin
 ```
 
-### 3. Validate a config
+Then follow the end-to-end `pacs.008` walk-through in [docs/QUICKSTART.md](docs/QUICKSTART.md).
 
-```bash
-cargo run -p mx20022-cli -- config validate docs/examples/basic.toml
-```
+## Example configs
 
-### 4. Run runtime
+- Baseline secure-ish local config: `docs/examples/basic.toml`
+- FedNow-style gateway profile: `docs/examples/fednow-gateway.toml`
+- MT-to-MX bridge profile: `docs/examples/mt-to-mx-bridge.toml`
+- Fast local onboarding config: `docs/examples/quickstart.toml`
 
-```bash
-cargo run -p mx20022-runtime -- --config docs/examples/basic.toml
-```
+## Documentation
 
-### 5. Run runtime with admin HTTP + gRPC
+- [docs/QUICKSTART.md](docs/QUICKSTART.md): clone to first `pacs.008` processing.
+- [docs/OPERATIONS.md](docs/OPERATIONS.md): runbook, health checks, observability, incident flow.
+- [docs/PARTICIPANT_GUIDE.md](docs/PARTICIPANT_GUIDE.md): participant design, registration, testing.
+- [architecture.md](architecture.md): full architecture and crate boundaries.
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): condensed architecture summary.
 
-```bash
-cargo run -p mx20022-runtime -- --config docs/examples/basic.toml --serve-admin --serve-admin-grpc
-```
+## Commercial licensing
 
-## Common Commands
+A draft enterprise licensing framework is documented in [COMMERCIAL_LICENSE.md](COMMERCIAL_LICENSE.md).
+For commercial terms, contact **licensing@k2payments.com**.
 
-Using `just`:
+## Contributing
 
-```bash
-just fmt
-just check
-just test
-just bench
-```
-
-Direct cargo equivalents:
-
-```bash
-cargo fmt --all
-cargo check --workspace
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
-cargo bench -p mx20022-runtime --no-run
-```
-
-## CLI (`mxctl`) Examples
-
-```bash
-# Validate config
-cargo run -p mx20022-cli -- config validate docs/examples/basic.toml
-
-# DB ops
-cargo run -p mx20022-cli -- db migrate docs/examples/basic.toml
-cargo run -p mx20022-cli -- db seed docs/examples/basic.toml
-
-# Runtime status (HTTP admin)
-cargo run -p mx20022-cli -- status --admin http://127.0.0.1:9090 --token <token>
-
-# Runtime status (gRPC admin)
-cargo run -p mx20022-cli -- status --admin-grpc http://127.0.0.1:9091
-
-# Trigger participant reload
-cargo run -p mx20022-cli -- reload --admin http://127.0.0.1:9090 --token <token>
-```
-
-## Configuration Notes
-
-- Main config is TOML (`RuntimeConfig` in `mx20022-config`).
-- Pipelines bind `channel_in`, optional `channel_out`, participants, `max_concurrent`, and optional `timeout_ms`.
-- `runtime.enforce_secure_channels = true` can block plaintext channel configs unless `allow_plaintext=true` is explicitly set per channel.
-- Admin auth supports `disabled`, `legacy_bearer`, and `jwt_hs256`.
-
-Start from:
-
-- `docs/examples/basic.toml`
-
-## Operational Docs
-
-- `docs/QUICKSTART.md`: fastest path to local runtime bring-up
-- `architecture.md` (root): engineering architecture reference
-- `contributor.md` (root): contributor workflow and standards
-- `docs/OPERATIONS.md`: operator runbook
-- `docs/PARTICIPANT_GUIDE.md`: participant development guide
-- `docs/ARCHITECTURE.md`: condensed architecture summary
-
-## Current Guarantees and Known Limits
-
-- Transaction lifecycle + audit persistence are strong and heavily tested.
-- Outbound channel delivery is wired and active.
-- Correlation supports in-memory fast path with store fallback for cross-instance correctness.
-- Full distributed correlation indexing and fully uniform TLS across all transports are still active areas.
-- Kafka offsets commit after enqueue (manual commit), not after full end-to-end business completion.
-
-## CI
-
-GitHub Actions runs:
-
-- `fmt`
-- `clippy`
-- `cargo-deny`
-- workspace tests (with Postgres service)
-- coverage gate (`cargo llvm-cov --fail-under-lines 55`)
-
-See `.github/workflows/ci.yml`.
+All external contributors must sign the Individual CLA before contributions can be merged.
+See [docs/legal/ICLA.md](docs/legal/ICLA.md) and [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
-Apache-2.0
+- Runtime code in this repository: **AGPL-3.0-only** ([LICENSE](LICENSE))
+- `mx20022` core library crates consumed by this runtime: **Apache-2.0** (separate upstream project/repository)
