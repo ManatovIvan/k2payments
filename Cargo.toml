@@ -50,3 +50,9 @@ prost-types = "0.13"
 mx20022-parse = "0.1.1"
 mx20022-validate = "0.1.1"
 mx20022-model = "0.1.1"
+subtle = "2.5"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"

@@ -230,19 +230,28 @@ impl Store for PostgresStore {
         tx_id: &str,
         update: TransactionUpdate,
     ) -> Result<(), StoreError> {
-        let mut record = self
-            .find_by_id(tx_id)
-            .await?
-            .ok_or_else(|| StoreError::new(format!("transaction not found: {tx_id}")))?;
-
-        if let Some(state) = update.state {
-            record.state = state;
+        let mark_completed = update.error.is_some();
+        let completed_at = mark_completed.then(|| encode_time(SystemTime::now()));
+        let result = sqlx::query(
+            "UPDATE transactions
+             SET state = COALESCE($1, state),
+                 completed_at = CASE
+                    WHEN $2 THEN COALESCE(completed_at, $3)
+                    ELSE completed_at
+                 END
+             WHERE tx_id = $4",
+        )
+        .bind(update.state)
+        .bind(mark_completed)
+        .bind(completed_at)
+        .bind(tx_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StoreError::new(format!("update_transaction failed: {e}")))?;
+        if result.rows_affected() == 0 {
+            return Err(StoreError::new(format!("transaction not found: {tx_id}")));
         }
-        if update.error.is_some() && record.completed_at.is_none() {
-            record.completed_at = Some(SystemTime::now());
-        }
-
-        self.begin_transaction(&record).await
+        Ok(())
     }
 
     async fn complete_transaction(&self, tx_id: &str, outcome: Outcome) -> Result<(), StoreError> {

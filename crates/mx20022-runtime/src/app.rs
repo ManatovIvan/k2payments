@@ -13,7 +13,22 @@ use std::time::{Duration, SystemTime};
 
 use tokio::sync::RwLock;
 
-use mx20022_config::{ParticipantConfig, RuntimeConfig};
+#[cfg(feature = "channel-amqp")]
+use mx20022_channel_amqp::{AmqpOutboundChannel, AmqpOutboundConfig};
+#[cfg(feature = "channel-file")]
+use mx20022_channel_file::FileOutboundChannel;
+#[cfg(feature = "channel-grpc")]
+use mx20022_channel_grpc::{GrpcOutboundChannel, GrpcOutboundConfig};
+#[cfg(feature = "channel-http")]
+use mx20022_channel_http::{HttpOutboundChannel, HttpOutboundConfig};
+#[cfg(feature = "channel-kafka")]
+use mx20022_channel_kafka::{KafkaOutboundChannel, KafkaOutboundConfig};
+#[cfg(feature = "channel-nats")]
+use mx20022_channel_nats::{NatsOutboundChannel, NatsOutboundConfig};
+#[cfg(feature = "channel-tcp")]
+use mx20022_channel_tcp::{TcpFraming, TcpOutboundChannel, TcpOutboundConfig};
+use mx20022_channels::{OutboundChannel, OutboundMessage};
+use mx20022_config::{ChannelSection, ParticipantConfig, RuntimeConfig};
 use mx20022_correlation::{CorrelationEngine, CorrelationLookupKey};
 use mx20022_participants::acknowledgement_builder::AcknowledgementBuilder;
 use mx20022_participants::business_rule_validator::BusinessRuleValidator;
@@ -81,6 +96,9 @@ struct PipelineRuntime {
     message_types: Vec<String>,
     participant_names: Vec<String>,
     manager: Arc<TransactionManager>,
+    channel_out: Option<String>,
+    outbound: Option<Arc<dyn OutboundChannel>>,
+    timeout_ms: Option<u64>,
 }
 
 impl Clone for PipelineRuntime {
@@ -89,6 +107,9 @@ impl Clone for PipelineRuntime {
             message_types: self.message_types.clone(),
             participant_names: self.participant_names.clone(),
             manager: Arc::clone(&self.manager),
+            channel_out: self.channel_out.clone(),
+            outbound: self.outbound.as_ref().map(Arc::clone),
+            timeout_ms: self.timeout_ms,
         }
     }
 }
@@ -137,6 +158,18 @@ impl RuntimeApp {
 
         for pipeline_cfg in &config.pipelines {
             let participants = build_participants(&pipeline_cfg.participants, Arc::clone(&store))?;
+            let channel_out = pipeline_cfg.channel_out.clone();
+            let outbound = if let Some(channel_name) = channel_out.as_ref() {
+                let channel_cfg = config.channels.get(channel_name).ok_or_else(|| {
+                    RuntimeBuildError::Channel(format!(
+                        "pipeline `{}` references missing channel_out `{}`",
+                        pipeline_cfg.name, channel_name
+                    ))
+                })?;
+                Some(build_outbound_channel(channel_name, channel_cfg)?)
+            } else {
+                None
+            };
             let runtime = PipelineRuntime {
                 message_types: pipeline_cfg.message_types.clone(),
                 participant_names: pipeline_cfg
@@ -145,6 +178,9 @@ impl RuntimeApp {
                     .map(|participant| participant.name.clone())
                     .collect(),
                 manager: Arc::new(TransactionManager::new(participants)),
+                channel_out,
+                outbound,
+                timeout_ms: pipeline_cfg.timeout_ms,
             };
             pipelines.insert(pipeline_cfg.name.clone(), runtime);
         }
@@ -254,22 +290,83 @@ impl RuntimeApp {
             .await
             .map_err(RuntimeBuildError::Store)?;
 
-        let report = runtime
-            .manager
-            .process(&mut ctx)
-            .await
-            .map_err(RuntimeBuildError::Processing)?;
+        let mut report = match runtime.timeout_ms.filter(|timeout_ms| *timeout_ms > 0) {
+            Some(timeout_ms) => {
+                let timed = tokio::time::timeout(
+                    Duration::from_millis(timeout_ms),
+                    runtime.manager.process(&mut ctx),
+                )
+                .await;
+                match timed {
+                    Ok(result) => result.map_err(RuntimeBuildError::Processing)?,
+                    Err(_) => {
+                        let context_entries = context_entries_for_tx(&request.tx_id, &ctx);
+                        self.store
+                            .batch_append_context_entries(&request.tx_id, &context_entries)
+                            .await
+                            .map_err(RuntimeBuildError::Store)?;
+                        self.store
+                            .complete_transaction(&request.tx_id, mx20022_store::Outcome::Poison)
+                            .await
+                            .map_err(RuntimeBuildError::Store)?;
+                        let duration_seconds = started
+                            .elapsed()
+                            .unwrap_or_else(|_| Duration::from_secs(0))
+                            .as_secs_f64();
+                        mx20022_metrics::record_transaction_duration(
+                            pipeline,
+                            &request.message_type,
+                            duration_seconds,
+                        );
+                        mx20022_metrics::record_transaction_total(
+                            pipeline,
+                            &request.message_type,
+                            "poison",
+                        );
+                        return Err(RuntimeBuildError::PipelineTimeout {
+                            pipeline: pipeline.to_string(),
+                            timeout_ms,
+                        });
+                    }
+                }
+            }
+            None => runtime
+                .manager
+                .process(&mut ctx)
+                .await
+                .map_err(RuntimeBuildError::Processing)?,
+        };
 
-        let context_entries: Vec<mx20022_store::ContextEntry> = ctx
-            .audit_log()
-            .iter()
-            .map(|entry| mx20022_store::ContextEntry {
-                tx_id: request.tx_id.clone(),
-                key: entry.key.clone(),
-                writer: entry.writer.clone(),
-                written_at: entry.written_at,
-            })
-            .collect();
+        let mut outbound_error = None::<String>;
+        if report.outcome == mx20022_runtime_core::transaction_manager::Outcome::Committed {
+            if let Some(outbound) = runtime.outbound.as_ref() {
+                if let Some(payload) = ctx.get_or_none::<String>("response.xml") {
+                    let content_type = ctx
+                        .get_or_none::<String>("response.content_type")
+                        .cloned()
+                        .unwrap_or_else(|| "application/xml".to_string());
+                    if let Err(error) = outbound
+                        .send(OutboundMessage {
+                            raw: payload.clone(),
+                            content_type,
+                        })
+                        .await
+                    {
+                        outbound_error = Some(error.to_string());
+                        report.outcome = mx20022_runtime_core::transaction_manager::Outcome::Poison;
+                    }
+                } else {
+                    tracing::warn!(
+                        tx_id = %request.tx_id,
+                        pipeline = %pipeline,
+                        channel_out = ?runtime.channel_out,
+                        "committed transaction has channel_out configured but no response.xml in context"
+                    );
+                }
+            }
+        }
+
+        let context_entries = context_entries_for_tx(&request.tx_id, &ctx);
         self.store
             .batch_append_context_entries(&request.tx_id, &context_entries)
             .await
@@ -318,6 +415,9 @@ impl RuntimeApp {
                 mx20022_runtime_core::transaction_manager::Outcome::Poison => "poison",
             },
         );
+        if let Some(error) = outbound_error {
+            return Err(RuntimeBuildError::Outbound(error));
+        }
         Ok(report)
     }
 
@@ -409,6 +509,18 @@ impl RuntimeApp {
                     pipeline_cfg.name
                 )));
             }
+            if existing.channel_out != pipeline_cfg.channel_out {
+                return Err(RuntimeBuildError::TopologyReloadNotAllowed(format!(
+                    "pipeline `{}` channel_out changed; restart is required",
+                    pipeline_cfg.name
+                )));
+            }
+            if existing.timeout_ms != pipeline_cfg.timeout_ms {
+                return Err(RuntimeBuildError::TopologyReloadNotAllowed(format!(
+                    "pipeline `{}` timeout_ms changed; restart is required",
+                    pipeline_cfg.name
+                )));
+            }
 
             let incoming_names = pipeline_cfg
                 .participants
@@ -428,6 +540,18 @@ impl RuntimeApp {
         for pipeline_cfg in &config.pipelines {
             let participants =
                 build_participants(&pipeline_cfg.participants, Arc::clone(&self.store))?;
+            let channel_out = pipeline_cfg.channel_out.clone();
+            let outbound = if let Some(channel_name) = channel_out.as_ref() {
+                let channel_cfg = config.channels.get(channel_name).ok_or_else(|| {
+                    RuntimeBuildError::Channel(format!(
+                        "pipeline `{}` references missing channel_out `{}`",
+                        pipeline_cfg.name, channel_name
+                    ))
+                })?;
+                Some(build_outbound_channel(channel_name, channel_cfg)?)
+            } else {
+                None
+            };
             rebuilt.insert(
                 pipeline_cfg.name.clone(),
                 PipelineRuntime {
@@ -438,6 +562,9 @@ impl RuntimeApp {
                         .map(|participant| participant.name.clone())
                         .collect(),
                     manager: Arc::new(TransactionManager::new(participants)),
+                    channel_out,
+                    outbound,
+                    timeout_ms: pipeline_cfg.timeout_ms,
                 },
             );
         }
@@ -451,6 +578,146 @@ impl RuntimeApp {
             pipelines_reloaded: config.pipelines.len(),
             participants_reloaded: config.pipelines.iter().map(|p| p.participants.len()).sum(),
         })
+    }
+}
+
+fn context_entries_for_tx(tx_id: &str, ctx: &Context) -> Vec<mx20022_store::ContextEntry> {
+    ctx.audit_log()
+        .iter()
+        .map(|entry| mx20022_store::ContextEntry {
+            tx_id: tx_id.to_string(),
+            key: entry.key.clone(),
+            writer: entry.writer.clone(),
+            written_at: entry.written_at,
+        })
+        .collect()
+}
+
+fn build_outbound_channel(
+    channel_name: &str,
+    channel_cfg: &ChannelSection,
+) -> Result<Arc<dyn OutboundChannel>, RuntimeBuildError> {
+    match (channel_cfg.channel_type.as_str(), channel_cfg.mode.as_str()) {
+        #[cfg(feature = "channel-http")]
+        ("http", "client") => Ok(Arc::new(HttpOutboundChannel::new(HttpOutboundConfig {
+            name: channel_name.to_string(),
+            endpoint: extract_required(channel_cfg, "endpoint")
+                .or_else(|_| extract_required(channel_cfg, "url"))?,
+            content_type: extract_optional(channel_cfg, "content_type")
+                .unwrap_or_else(|| "application/xml".to_string()),
+        }))),
+        #[cfg(feature = "channel-grpc")]
+        ("grpc", "client") => Ok(Arc::new(GrpcOutboundChannel::new(GrpcOutboundConfig {
+            name: channel_name.to_string(),
+            endpoint: extract_required(channel_cfg, "endpoint")
+                .or_else(|_| extract_required(channel_cfg, "url"))?,
+        }))),
+        #[cfg(feature = "channel-tcp")]
+        ("tcp", "client") => Ok(Arc::new(TcpOutboundChannel::new(TcpOutboundConfig {
+            name: channel_name.to_string(),
+            endpoint: extract_required(channel_cfg, "endpoint")
+                .or_else(|_| extract_required(channel_cfg, "url"))?,
+            framing: extract_tcp_framing(channel_cfg),
+            content_type: extract_optional(channel_cfg, "content_type")
+                .unwrap_or_else(|| "application/xml".to_string()),
+        }))),
+        #[cfg(feature = "channel-file")]
+        ("file", "write") => Ok(Arc::new(FileOutboundChannel::new(
+            channel_name.to_string(),
+            extract_required(channel_cfg, "directory")?,
+            extract_optional(channel_cfg, "extension").unwrap_or_else(|| "xml".to_string()),
+        ))),
+        #[cfg(feature = "channel-nats")]
+        ("nats", "publisher") => Ok(Arc::new(NatsOutboundChannel::new(NatsOutboundConfig {
+            name: channel_name.to_string(),
+            endpoint: extract_required(channel_cfg, "endpoint")
+                .or_else(|_| extract_required(channel_cfg, "url"))?,
+            subject: extract_required(channel_cfg, "subject")?,
+        }))),
+        #[cfg(feature = "channel-kafka")]
+        ("kafka", "producer") => Ok(Arc::new(KafkaOutboundChannel::new(KafkaOutboundConfig {
+            name: channel_name.to_string(),
+            brokers: extract_string_list_or_single(channel_cfg, "brokers")
+                .or_else(|| extract_optional(channel_cfg, "bootstrap_servers"))
+                .ok_or_else(|| {
+                    RuntimeBuildError::Channel(format!(
+                        "channel `{channel_name}` requires `brokers` or `bootstrap_servers`"
+                    ))
+                })?,
+            topic: extract_required(channel_cfg, "topic")?,
+        }))),
+        #[cfg(feature = "channel-amqp")]
+        ("amqp", "publisher") => Ok(Arc::new(AmqpOutboundChannel::new(AmqpOutboundConfig {
+            name: channel_name.to_string(),
+            url: extract_required(channel_cfg, "url")?,
+            exchange: extract_optional(channel_cfg, "exchange").unwrap_or_default(),
+            routing_key: extract_required(channel_cfg, "routing_key")
+                .or_else(|_| extract_required(channel_cfg, "queue"))?,
+        }))),
+        _ => Err(RuntimeBuildError::Channel(format!(
+            "unsupported outbound channel `{channel_name}` type=`{}` mode=`{}`",
+            channel_cfg.channel_type, channel_cfg.mode
+        ))),
+    }
+}
+
+fn extract_required(channel_cfg: &ChannelSection, key: &str) -> Result<String, RuntimeBuildError> {
+    channel_cfg
+        .extra
+        .get(key)
+        .and_then(|v| v.as_str())
+        .map(ToString::to_string)
+        .ok_or_else(|| RuntimeBuildError::Channel(format!("channel requires `{key}`")))
+}
+
+fn extract_optional(channel_cfg: &ChannelSection, key: &str) -> Option<String> {
+    channel_cfg
+        .extra
+        .get(key)
+        .and_then(|v| v.as_str())
+        .map(ToString::to_string)
+}
+
+#[cfg(feature = "channel-kafka")]
+fn extract_string_list_or_single(channel_cfg: &ChannelSection, key: &str) -> Option<String> {
+    let value = channel_cfg.extra.get(key)?;
+    if let Some(v) = value.as_str() {
+        return Some(v.to_string());
+    }
+    if let Some(values) = value.as_array() {
+        let items = values
+            .iter()
+            .filter_map(|v| v.as_str().map(ToString::to_string))
+            .collect::<Vec<_>>();
+        if items.is_empty() {
+            None
+        } else {
+            Some(items.join(","))
+        }
+    } else {
+        None
+    }
+}
+
+#[cfg(feature = "channel-tcp")]
+fn extract_u64(channel_cfg: &ChannelSection, key: &str) -> Option<u64> {
+    channel_cfg
+        .extra
+        .get(key)
+        .and_then(|v| v.as_integer())
+        .and_then(|v| u64::try_from(v).ok())
+}
+
+#[cfg(feature = "channel-tcp")]
+fn extract_tcp_framing(channel_cfg: &ChannelSection) -> TcpFraming {
+    match extract_optional(channel_cfg, "framing").as_deref() {
+        Some("delimiter") => {
+            let delimiter = extract_u64(channel_cfg, "delimiter_byte")
+                .and_then(|v| u8::try_from(v).ok())
+                .unwrap_or(b'\n');
+            TcpFraming::Delimiter(delimiter)
+        }
+        _ => TcpFraming::LengthPrefixed,
     }
 }
 
@@ -678,6 +945,12 @@ pub enum RuntimeBuildError {
         pipeline: String,
         message_type: String,
     },
+    #[error("channel configuration error: {0}")]
+    Channel(String),
+    #[error("pipeline `{pipeline}` timed out after {timeout_ms}ms")]
+    PipelineTimeout { pipeline: String, timeout_ms: u64 },
+    #[error("outbound delivery failed: {0}")]
+    Outbound(String),
     #[error(transparent)]
     Domain(#[from] DomainError),
     #[error(transparent)]
@@ -774,6 +1047,35 @@ participants = [
 ]
 "#;
 
+    const OUTBOUND_CONFIG: &str = r#"
+[runtime]
+name = "test-runtime"
+instance_id = "local-01"
+
+[store]
+backend = "sqlite"
+url = "sqlite::memory:"
+
+[channels.http-in]
+type = "http"
+mode = "server"
+bind = "127.0.0.1:8080"
+
+[channels.http-out]
+type = "http"
+mode = "client"
+endpoint = "http://127.0.0.1:9/outbox"
+
+[[pipeline]]
+name = "outbound"
+channel_in = "http-in"
+channel_out = "http-out"
+message_types = ["pacs.008"]
+participants = [
+  { name = "acknowledgement-builder", config = {} },
+]
+"#;
+
     #[tokio::test]
     async fn duplicate_checker_aborts_pipeline_when_message_id_exists() {
         let config = RuntimeConfig::parse(DUPLICATE_GUARD_CONFIG).expect("config should parse");
@@ -806,6 +1108,30 @@ participants = [
             .expect("process should return report");
 
         assert_eq!(report.outcome, Outcome::Aborted);
+    }
+
+    #[tokio::test]
+    async fn outbound_delivery_failure_marks_transaction_poison() {
+        let config = RuntimeConfig::parse(OUTBOUND_CONFIG).expect("config should parse");
+        let app = RuntimeApp::from_config(&config)
+            .await
+            .expect("app should build");
+        let err = app
+            .process("outbound", "TX-OUT-1", "http-in", "pacs.008", "<Document/>")
+            .await
+            .expect_err("outbound send should fail");
+        assert!(
+            err.to_string().contains("outbound delivery failed"),
+            "unexpected error: {err}"
+        );
+
+        let record = app
+            .store_handle()
+            .find_by_id("TX-OUT-1")
+            .await
+            .expect("lookup")
+            .expect("record");
+        assert_eq!(record.state, "POISON");
     }
 
     const RECOVERY_CONFIG: &str = r#"

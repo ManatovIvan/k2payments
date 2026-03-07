@@ -1,0 +1,75 @@
+{
+  "metadata": {
+    "task_short": "test-coverage-audit",
+    "agent_abbr": "ta",
+    "datetime_utc": "2026-03-06T00:00:00Z",
+    "filename": "2026-03-06T00-00-00Z__test-coverage-audit__ta.json",
+    "supersedes": null,
+    "version": "1.0"
+  },
+  "state": {
+    "objectives": [
+      "Evaluate test coverage and quality across all 22 crates in the mx20022 payments runtime workspace"
+    ],
+    "constraints": [
+      "Read-only audit — no code changes",
+      "Assess all #[cfg(test)] sections, tests/ dir, harness/, fixtures/, benches/, and CI config"
+    ],
+    "important_facts": [
+      "tests/harness/ is empty — no integration test harness exists",
+      "tests/fixtures/ is empty — no shared ISO 20022 XML fixtures exist",
+      "benches/ directory is empty — no benchmarks exist",
+      "CI workflow (ci.yml) runs only: cargo fmt --check and cargo test --workspace",
+      "No proptest, quickcheck, or criterion in any Cargo.toml",
+      "tests_missing.rs files in runtime-core and store-sqlite are NOT wired into the build (marked with explicit comment)",
+      "mx20022-store-postgres and mx20022-store-rocksdb have zero tests",
+      "mx20022-channels http/kafka/amqp/nats have zero tests",
+      "mx20022-runtime-core context.rs and state.rs have no inline tests (covered partially by tests_missing.rs which IS wired via lib.rs)",
+      "22 workspace members total; ~14 have at least one test",
+      "Single combined test in correlation covers register+match+timeout in one function — not separated",
+      "Session manager missing tests for reconnect_after_failure, sequence rollback, connect-from-wrong-state",
+      "CryptoService has only one encrypt/decrypt roundtrip test — missing empty key, wrong key decryption, unsupported algorithm",
+      "No mock Store implementation — tests use real SqliteStore (in-memory) as the integration vehicle",
+      "AdminGrpcService has a test (grpc.rs line ~200-273)"
+    ],
+    "decisions_made": [
+      "Categorized each crate as: tested / partially tested / untested"
+    ],
+    "artifacts": [
+      "/Volumes/Everything/Development/k2payments/crates/mx20022-runtime-core/src/tests_missing.rs",
+      "/Volumes/Everything/Development/k2payments/crates/mx20022-store/mx20022-store-sqlite/src/tests_missing.rs",
+      "/Volumes/Everything/Development/k2payments/.github/workflows/ci.yml"
+    ],
+    "dependencies": [],
+    "risks_issues": [
+      "tests_missing.rs for store-sqlite is explicitly NOT wired in (comment says so) — 5 high-value tests are dead code",
+      "Postgres and RocksDB store backends have zero test coverage — production backends are unvalidated",
+      "No benchmark coverage on critical path (TransactionManager.process, schema validation)",
+      "No property-based testing on ISO 20022 field validators (BIC, IBAN, UETR format checks)",
+      "CI only runs cargo test — no coverage reporting, no clippy, no deny"
+    ]
+  },
+  "iteration": {
+    "summary": "Performed a full read of all 55 Rust source files across 22 crates, the CI workflow, migrations, seeds, and directory structure. Found a workspace with solid unit test coverage in the business logic layer (participants, correlation, session, crypto, config, admin) but with critical gaps in infrastructure: the Postgres and RocksDB store backends are completely untested, all message-transport channels (HTTP, Kafka, AMQP, NATS) have no tests, the tests/ harness and fixtures directories are empty stubs, the benches/ directory is empty, and there is no property-based testing anywhere. The tests_missing.rs file for the SQLite store contains 5 well-designed tests but is explicitly excluded from the build. CI is minimal — format check plus cargo test, no coverage gate, no clippy, no cargo-deny.",
+    "inputs_consulted": [
+      "/Volumes/Everything/Development/k2payments/Cargo.toml",
+      "/Volumes/Everything/Development/k2payments/.github/workflows/ci.yml",
+      "All 55 .rs source files under crates/",
+      "/Volumes/Everything/Development/k2payments/crates/mx20022-store/mx20022-store-sqlite/migrations/0001_initial_schema.up.sql",
+      "/Volumes/Everything/Development/k2payments/crates/mx20022-store/mx20022-store-sqlite/seeds/dev_seed.sql"
+    ],
+    "outputs_produced": [
+      "Structured test coverage report (returned to user)"
+    ],
+    "next_actions": [
+      "Wire tests_missing.rs into the build for store-sqlite",
+      "Add Postgres integration tests using testcontainers-rs",
+      "Add proptest coverage for BIC/IBAN/UETR/currency validation rules",
+      "Add benchmarks for TransactionManager.process with criterion",
+      "Add at least one realistic ISO 20022 XML fixture to tests/fixtures/"
+    ]
+  },
+  "cross_agent_notes": {
+    "mentions": []
+  }
+}

@@ -1,0 +1,155 @@
+{
+  "metadata": {
+    "task_short": "test-coverage-audit",
+    "agent_abbr": "ta",
+    "datetime_utc": "2026-03-07T00:00:00Z",
+    "filename": "2026-03-07T00-00-00Z__test-coverage-audit__ta.json",
+    "supersedes": "2026-03-06T21-30-00Z__test-coverage-audit__ta.json",
+    "version": "1.0"
+  },
+  "state": {
+    "objectives": [
+      "Full test coverage audit of the mx20022 payments runtime workspace at /Volumes/Everything/Development/k2payments"
+    ],
+    "constraints": [
+      "Read-only: no code changes",
+      "Assess all #[cfg(test)] sections, integration tests/, CI config, and dead test files"
+    ],
+    "important_facts": [
+      "Third-pass audit. Commit 70f8383 (fix: Address critical security, performance, and architecture findings) introduced major test improvements across the workspace.",
+      "Total test functions (workspace source, excluding target/): 80 test functions across 34 files.",
+      "22-crate workspace: mx20022-runtime, mx20022-runtime-core, mx20022-config, mx20022-participants, mx20022-crypto, mx20022-store (sqlite/postgres/rocksdb), mx20022-correlation, mx20022-admin, mx20022-session, mx20022-metrics, mx20022-channels (http/grpc/tcp/file/kafka/nats/amqp), mx20022-cli, mx20022-correlation.",
+      "CI: fmt + clippy + cargo-deny + cargo test --workspace + cargo llvm-cov --fail-under-lines 1 (threshold is 1%, effectively no gate).",
+      "No proptest/quickcheck/criterion/testcontainers/mockall in lockfile or any Cargo.toml.",
+      "benches/ directory: empty (no benchmark files).",
+      "tests/fixtures/ and tests/harness/: still empty stubs.",
+      "mx20022-runtime-core/tests_missing.rs: NOW fully compiled (mod tests_missing) — 5 tests covering Poison-commit path, Poison-abort path, state machine transitions, context type-mismatch, and prepare-error-triggers-abort-rollback.",
+      "mx20022-runtime/src/engine.rs: NOW 6 tests — infer_message_type (json/xml/fallback), build_tx_id_prefix, next_tx_id uniqueness, extract_inbound_auth static_bearer rejection/acceptance.",
+      "mx20022-runtime/src/domain.rs: NOW 2 tests — validates_happy_path, rejects_empty_required_fields (covers all 5 fields in one test body).",
+      "mx20022-runtime/src/application.rs: NOW 2 tests — begin_record_maps_request_fields, map_outcome_covers_all_variants (all 3 enum arms).",
+      "mx20022-crypto/src/lib.rs: NOW 5 tests — roundtrip, empty key rejection, wrong-key decryption fail, unsupported algorithm, tampered ciphertext.",
+      "mx20022-participants/circuit_breaker.rs: NOW 2 tests — opens_after_threshold, recovers_after_open_duration_expires.",
+      "mx20022-participants/duplicate_checker.rs: NOW 4 tests — aborts on dup, prepares on no dup, prepares on missing XML keys, marks_first_matching_duplicate_key.",
+      "mx20022-participants/acknowledgement_builder.rs: NOW 2 tests — writes_ack_on_commit, overwrite_existing_replaces_response_payload.",
+      "mx20022-participants/status_response_builder.rs: NOW 2 tests — writes_commit_status (ACTC), writes_abort_status (RJCT).",
+      "mx20022-participants/business_rule_validator.rs: 2 tests — accepts_valid_amount_currency, rejects_disallowed_currency.",
+      "mx20022-participants/schema_validator.rs: 2 tests — accepts_well_formed_xml, rejects_malformed_xml.",
+      "mx20022-participants/rate_limiter.rs: 1 test — aborts_when_burst_is_consumed.",
+      "mx20022-participants/routing_engine.rs: 2 tests — matches_route_by_currency, falls_back_to_default_route.",
+      "mx20022-participants/error_response_builder.rs: 1 test block.",
+      "mx20022-participants/message_logger.rs: 2 tests — masks_sensitive_tags, logger_masks_multiple_fields.",
+      "mx20022-store-sqlite/lib.rs: 3 tests (begin_find_update_complete_transaction, expectation_and_dead_letter_round_trip, query_applies_sql_filters_and_limit) + tests_missing.rs: 7 tests (find_by_message_id, find_by_uetr, find_by_end_to_end_id, complete_transaction all outcomes, replay_dead_letter error for unknown id, list_dead_letters filters, update_transaction errors when not found).",
+      "mx20022-store-postgres/lib.rs: 2 tests using connect_or_skip() — only run if DATABASE_URL env var is set. Silently skip in standard CI (no Postgres service container).",
+      "mx20022-store-rocksdb/src/lib.rs: ZERO tests. No #[cfg(test)] block.",
+      "mx20022-admin/auth.rs: 5 tests covering JWT roles, denied role, mTLS, legacy token, readonly path.",
+      "mx20022-admin/grpc.rs: 1 test — grpc_service_returns_status_and_tx.",
+      "mx20022-admin/http.rs: 1 test — dispatches_status_and_tx_routes.",
+      "mx20022-admin/service.rs: 1 test — returns_status_and_transaction_details.",
+      "mx20022-correlation/lib.rs: 1 combined test — register_match_and_timeout.",
+      "mx20022-metrics/lib.rs: 1 test — metrics_are_exported.",
+      "mx20022-session/lib.rs: 1 test — tracks_sequence_and_state.",
+      "mx20022-channels/src/auth.rs: 2 tests — static_bearer_passes_and_fails, jwt_requires_role_when_configured.",
+      "mx20022-channels/channel-file: 2 tests — outbound_writes_file, inbound_reads_and_moves_file.",
+      "mx20022-channels/channel-grpc: 1 test block.",
+      "mx20022-channels/channel-tcp: 1 test block.",
+      "mx20022-channels/channel-http, kafka, nats, amqp: ZERO tests.",
+      "mx20022-cli: ZERO tests.",
+      "mx20022-runtime/src/app.rs: 6 tests (builds_runtime_from_valid_config, processes_message_through_pipeline, duplicate_checker aborts, recovers_incomplete_transactions, reloads_participant_configs, rejects_reload_when_topology_changes).",
+      "E2E test: crates/mx20022-runtime/tests/e2e_pipeline.rs — 1 test covering full config->app->process->store pipeline.",
+      "REMAINING GAPS: RocksDB store (zero tests), channel-http/kafka/nats/amqp (zero tests), CLI (zero tests), routing_engine missing no-route error path, rate_limiter missing per-message-type and per-channel scope tests, correlation missing reload_pending test, session missing reconnect_after_failure and heartbeat tests, admin missing unauthorized path tests for gRPC/HTTP."
+    ],
+    "decisions_made": [
+      "Confirmed PostgresStore tests silently skip in CI — they use connect_or_skip() guard with no DATABASE_URL service container in ci.yml: tests pass trivially without exercising Postgres at all.",
+      "Coverage threshold of 1 line is effectively no gate — passes on any compile.",
+      "All prior gaps flagged as CRITICAL in last audit have been addressed except: RocksDB zero tests, channel adapter tests, CLI zero tests, coverage threshold meaningless."
+    ],
+    "artifacts": [
+      "/Volumes/Everything/Development/k2payments/.github/workflows/ci.yml",
+      "/Volumes/Everything/Development/k2payments/crates/mx20022-runtime/tests/e2e_pipeline.rs",
+      "/Volumes/Everything/Development/k2payments/crates/mx20022-runtime-core/src/tests_missing.rs",
+      "/Volumes/Everything/Development/k2payments/crates/mx20022-store/mx20022-store-sqlite/src/tests_missing.rs",
+      "/Volumes/Everything/Development/k2payments/crates/mx20022-store/mx20022-store-postgres/src/lib.rs (line 723: connect_or_skip)",
+      "/Volumes/Everything/Development/k2payments/crates/mx20022-store/mx20022-store-rocksdb/src/lib.rs (zero tests)"
+    ],
+    "dependencies": [],
+    "risks_issues": [
+      "RocksDB store: zero tests — production storage backend entirely unvalidated. If deployed, data loss or corruption would be silent.",
+      "Postgres tests silently skip: connect_or_skip() returns None when DATABASE_URL is absent — CI always passes trivially for postgres tests.",
+      "Coverage gate is 1 line (--fail-under-lines 1): provides no regression protection. Could drop to 0 and still pass.",
+      "channel-http/kafka/nats/amqp: zero channel adapter tests — the inbound receivers for most production protocol paths are untested.",
+      "mx20022-cli: zero tests. No validation of CLI argument parsing or startup command surface.",
+      "RateLimiter: only 1 test covering Global scope burst exhaustion. MessageType and SourceChannel scopes untested.",
+      "CorrelationEngine: register+match+timeout combined in 1 test — reload_pending (from store) path not independently verified.",
+      "Session: 1 test covering sequence tracking. reconnect_after_failure and heartbeat_tick paths untested.",
+      "RoutingEngine: no-route error path (no rules, no default) untested — prepare() returns Err in that case.",
+      "Admin HTTP/gRPC: only happy-path authorized requests tested — unauthorized/malformed auth paths not tested at handler level."
+    ]
+  },
+  "iteration": {
+    "summary": "Third full pass. Since the previous audit, commit 70f8383 addressed every CRITICAL gap previously flagged: engine.rs now has 6 tests, domain.rs has 2, application.rs has 2, crypto has 5 covering all error paths, circuit_breaker has 2 (including auto-recovery), duplicate_checker has 4 (including multi-key and no-XML-keys cases), acknowledgement_builder and status_response_builder both have their abort/overwrite paths covered, and runtime-core's tests_missing.rs is now compiled with 5 high-value 2PC edge-case tests. SQLite store tests_missing.rs contributes 7 additional store-layer tests. Total workspace test count is approximately 80 functions. The remaining gaps are: RocksDB store (zero tests), channel-http/kafka/nats/amqp (zero tests), Postgres tests that silently skip in CI, a coverage gate of 1% that is effectively no gate, and an empty benches/ directory.",
+    "inputs_consulted": [
+      "/Volumes/Everything/Development/k2payments/crates/mx20022-runtime/src/engine.rs",
+      "/Volumes/Everything/Development/k2payments/crates/mx20022-runtime/src/domain.rs",
+      "/Volumes/Everything/Development/k2payments/crates/mx20022-runtime/src/application.rs",
+      "/Volumes/Everything/Development/k2payments/crates/mx20022-runtime/src/app.rs",
+      "/Volumes/Everything/Development/k2payments/crates/mx20022-runtime/tests/e2e_pipeline.rs",
+      "/Volumes/Everything/Development/k2payments/crates/mx20022-runtime-core/src/tests_missing.rs",
+      "/Volumes/Everything/Development/k2payments/crates/mx20022-crypto/src/lib.rs",
+      "/Volumes/Everything/Development/k2payments/crates/mx20022-participants/src/circuit_breaker.rs",
+      "/Volumes/Everything/Development/k2payments/crates/mx20022-participants/src/duplicate_checker.rs",
+      "/Volumes/Everything/Development/k2payments/crates/mx20022-participants/src/acknowledgement_builder.rs",
+      "/Volumes/Everything/Development/k2payments/crates/mx20022-participants/src/status_response_builder.rs",
+      "/Volumes/Everything/Development/k2payments/crates/mx20022-participants/src/rate_limiter.rs",
+      "/Volumes/Everything/Development/k2payments/crates/mx20022-participants/src/routing_engine.rs",
+      "/Volumes/Everything/Development/k2payments/crates/mx20022-participants/src/business_rule_validator.rs",
+      "/Volumes/Everything/Development/k2payments/crates/mx20022-participants/src/schema_validator.rs",
+      "/Volumes/Everything/Development/k2payments/crates/mx20022-store/mx20022-store-sqlite/src/lib.rs",
+      "/Volumes/Everything/Development/k2payments/crates/mx20022-store/mx20022-store-sqlite/src/tests_missing.rs",
+      "/Volumes/Everything/Development/k2payments/crates/mx20022-store/mx20022-store-postgres/src/lib.rs",
+      "/Volumes/Everything/Development/k2payments/crates/mx20022-store/mx20022-store-rocksdb/src/lib.rs",
+      "/Volumes/Everything/Development/k2payments/crates/mx20022-correlation/src/lib.rs",
+      "/Volumes/Everything/Development/k2payments/crates/mx20022-admin/src/auth.rs",
+      "/Volumes/Everything/Development/k2payments/crates/mx20022-admin/src/grpc.rs",
+      "/Volumes/Everything/Development/k2payments/crates/mx20022-admin/src/http.rs",
+      "/Volumes/Everything/Development/k2payments/crates/mx20022-admin/src/service.rs",
+      "/Volumes/Everything/Development/k2payments/crates/mx20022-session/src/lib.rs",
+      "/Volumes/Everything/Development/k2payments/crates/mx20022-channels/mx20022-channel-file/src/lib.rs",
+      "/Volumes/Everything/Development/k2payments/.github/workflows/ci.yml",
+      "/Volumes/Everything/Development/k2payments/Cargo.toml"
+    ],
+    "outputs_produced": [
+      "Comprehensive test coverage audit report delivered to user",
+      "Updated context file at /Volumes/Everything/Development/k2payments/docs/agents/2026-03-07T00-00-00Z__test-coverage-audit__ta.json"
+    ],
+    "next_actions": [
+      "Add #[cfg(test)] block to mx20022-store-rocksdb using tempfile crate for isolated on-disk tests",
+      "Add Postgres service container to ci.yml (services: postgres:16) so connect_or_skip tests actually run in CI",
+      "Raise coverage threshold from 1 to 60 (lines) once RocksDB and channel gaps are filled",
+      "Add RoutingEngine test: no rules and no default_route should return Err from prepare()",
+      "Add RateLimiter tests for MessageType and SourceChannel scope isolation",
+      "Add Session tests for reconnect_after_failure and heartbeat_tick paths",
+      "Add CorrelationEngine test for reload_pending independently (seed expectation, then call reload_pending, verify index populated)",
+      "Add admin HTTP/gRPC unauthorized path tests (missing/wrong bearer, missing role)",
+      "Add criterion benchmark harness for TransactionManager.process() throughput"
+    ]
+  },
+  "cross_agent_notes": {
+    "mentions": [
+      {
+        "agent_abbr": "sec",
+        "filename": "2026-03-06T20-00-00Z__security-audit__sec.json",
+        "relevance_note": "CryptoService now has 5 tests including tampered ciphertext and wrong-key — matches sec audit recommendation. Admin unauthorized paths still not tested at handler layer."
+      },
+      {
+        "agent_abbr": "cr",
+        "filename": "2026-03-06T08-00-00Z__code-quality-review__cr.json",
+        "relevance_note": "engine.rs complexity flagged by CR — now has 6 focused unit tests. RocksDB store still zero tests, also a quality concern."
+      },
+      {
+        "agent_abbr": "ar",
+        "filename": "2026-03-06T12-00-00Z__arch-review__ar.json",
+        "relevance_note": "Arch review noted store backend abstraction — RocksDB remaining untested is an architecture risk for any production deployment using that backend."
+      }
+    ]
+  }
+}

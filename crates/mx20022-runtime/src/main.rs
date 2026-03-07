@@ -83,7 +83,13 @@ async fn run() -> Result<(), RuntimeBootstrapError> {
         .unwrap_or_else(|| "127.0.0.1:9091".to_string());
     let admin_auth = build_admin_auth(&config);
     let admin_tls = build_admin_tls(&config);
+    let admin_cors_allowed_origins = config.runtime.admin_cors_allowed_origins.clone();
     let service_mode = (cli.run_pipelines, cli.serve_admin, cli.serve_admin_grpc);
+    if matches!(admin_auth.mode, AdminAuthMode::Disabled)
+        && (cli.serve_admin || cli.serve_admin_grpc)
+    {
+        tracing::warn!("admin auth is disabled while admin service is enabled");
+    }
 
     match service_mode {
         (true, true, true) => {
@@ -96,7 +102,7 @@ async fn run() -> Result<(), RuntimeBootstrapError> {
                 res = engine::run_pipelines(Arc::clone(&app), config.clone()) => {
                     res.map_err(RuntimeBootstrapError::Engine)?;
                 }
-                res = host::serve_with_tls(&admin_bind, Arc::clone(&controller), admin_auth.clone(), admin_tls.clone()) => {
+                res = host::serve_with_tls_and_cors(&admin_bind, Arc::clone(&controller), admin_auth.clone(), admin_tls.clone(), admin_cors_allowed_origins.clone()) => {
                     res.map_err(RuntimeBootstrapError::AdminHost)?;
                 }
                 res = grpc::serve_with_tls(&admin_grpc_bind, controller, admin_auth.clone(), admin_tls.clone()) => {
@@ -114,7 +120,7 @@ async fn run() -> Result<(), RuntimeBootstrapError> {
                 res = engine::run_pipelines(Arc::clone(&app), config.clone()) => {
                     res.map_err(RuntimeBootstrapError::Engine)?;
                 }
-                res = host::serve_with_tls(&admin_bind, controller, admin_auth.clone(), admin_tls.clone()) => {
+                res = host::serve_with_tls_and_cors(&admin_bind, controller, admin_auth.clone(), admin_tls.clone(), admin_cors_allowed_origins.clone()) => {
                     res.map_err(RuntimeBootstrapError::AdminHost)?;
                 }
             }
@@ -147,7 +153,7 @@ async fn run() -> Result<(), RuntimeBootstrapError> {
             tracing::info!(bind = %admin_bind, grpc_bind = %admin_grpc_bind, "starting admin http+grpc hosts");
 
             tokio::select! {
-                res = host::serve_with_tls(&admin_bind, Arc::clone(&controller), admin_auth.clone(), admin_tls.clone()) => {
+                res = host::serve_with_tls_and_cors(&admin_bind, Arc::clone(&controller), admin_auth.clone(), admin_tls.clone(), admin_cors_allowed_origins.clone()) => {
                     res.map_err(RuntimeBootstrapError::AdminHost)?;
                 }
                 res = grpc::serve_with_tls(&admin_grpc_bind, controller, admin_auth.clone(), admin_tls.clone()) => {
@@ -160,11 +166,12 @@ async fn run() -> Result<(), RuntimeBootstrapError> {
                 build_admin_controller(&app, cli.config_path.clone(), Arc::clone(&reload_status))
                     .await;
             tracing::info!(bind = %admin_bind, "starting admin host");
-            host::serve_with_tls(
+            host::serve_with_tls_and_cors(
                 &admin_bind,
                 controller,
                 admin_auth.clone(),
                 admin_tls.clone(),
+                admin_cors_allowed_origins.clone(),
             )
             .await
             .map_err(RuntimeBootstrapError::AdminHost)?;

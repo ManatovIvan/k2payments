@@ -16,7 +16,9 @@ pub struct RuntimeConfig {
 
 impl RuntimeConfig {
     pub fn parse(content: &str) -> Result<Self, ConfigError> {
-        let cfg: RuntimeConfig = toml::from_str(content)?;
+        let mut value: toml::Value = toml::from_str(content)?;
+        resolve_value_secrets(&mut value)?;
+        let cfg: RuntimeConfig = value.try_into()?;
         cfg.validate()?;
         Ok(cfg)
     }
@@ -78,7 +80,11 @@ impl RuntimeConfig {
 
         let auth = &self.runtime.admin_auth;
         match auth.mode.as_str() {
-            "disabled" => {}
+            "disabled" => {
+                tracing::warn!(
+                    "runtime.admin_auth.mode=disabled leaves admin endpoints unauthenticated"
+                );
+            }
             "legacy_bearer" => {
                 tracing::warn!(
                     "admin_auth.mode=legacy_bearer is insecure; consider jwt_hs256 or disabled"
@@ -133,6 +139,71 @@ impl RuntimeConfig {
     }
 }
 
+fn resolve_value_secrets(value: &mut toml::Value) -> Result<(), ConfigError> {
+    match value {
+        toml::Value::String(s) => {
+            let expanded = expand_env_tokens(s)?;
+            if let Some(secret_path) = expanded.strip_prefix("secret://") {
+                let secret = fs::read_to_string(secret_path).map_err(|e| {
+                    ConfigError::Validation(format!(
+                        "failed to read secret file `{secret_path}`: {e}"
+                    ))
+                })?;
+                *s = secret.trim_end_matches(['\n', '\r']).to_string();
+            } else {
+                *s = expanded;
+            }
+            Ok(())
+        }
+        toml::Value::Array(items) => {
+            for item in items {
+                resolve_value_secrets(item)?;
+            }
+            Ok(())
+        }
+        toml::Value::Table(table) => {
+            for item in table.iter_mut().map(|(_, value)| value) {
+                resolve_value_secrets(item)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn expand_env_tokens(input: &str) -> Result<String, ConfigError> {
+    let mut output = String::with_capacity(input.len());
+    let mut remaining = input;
+
+    loop {
+        let Some(start) = remaining.find("${") else {
+            output.push_str(remaining);
+            return Ok(output);
+        };
+
+        output.push_str(&remaining[..start]);
+        let after_start = &remaining[start + 2..];
+        let Some(end) = after_start.find('}') else {
+            return Err(ConfigError::Validation(
+                "unterminated environment token `${...}`".to_string(),
+            ));
+        };
+        let var_name = &after_start[..end];
+        if var_name.trim().is_empty() {
+            return Err(ConfigError::Validation(
+                "empty environment token `${}` is invalid".to_string(),
+            ));
+        }
+        let value = std::env::var(var_name).map_err(|_| {
+            ConfigError::Validation(format!(
+                "environment variable `{var_name}` referenced in config is not set"
+            ))
+        })?;
+        output.push_str(&value);
+        remaining = &after_start[end + 1..];
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct RuntimeSection {
     pub name: String,
@@ -145,6 +216,8 @@ pub struct RuntimeSection {
     pub admin_bind: Option<String>,
     #[serde(default)]
     pub admin_grpc_bind: Option<String>,
+    #[serde(default)]
+    pub admin_cors_allowed_origins: Vec<String>,
     #[serde(default)]
     pub correlation_scan_interval_ms: Option<u64>,
     #[serde(default)]
@@ -331,6 +404,9 @@ pub enum ConfigError {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use super::RuntimeConfig;
 
     const BASE_CONFIG: &str = r#"
@@ -672,5 +748,48 @@ path = "/inbox"
         let parsed = RuntimeConfig::parse(BASE_CONFIG).expect("base config should be valid");
         assert_eq!(parsed.runtime.name, "runtime");
         assert_eq!(parsed.pipelines.len(), 1);
+    }
+
+    #[test]
+    fn parse_expands_env_tokens() {
+        std::env::set_var("MX20022_TEST_SECRET", "from-env");
+        let config = format!(
+            r#"{BASE_CONFIG}
+[runtime.admin_auth]
+mode = "jwt_hs256"
+jwt_hs256_secret = "${{MX20022_TEST_SECRET}}"
+"#
+        );
+        let parsed = RuntimeConfig::parse(&config).expect("config should parse");
+        assert_eq!(
+            parsed.runtime.admin_auth.jwt_hs256_secret.as_deref(),
+            Some("from-env")
+        );
+    }
+
+    #[test]
+    fn parse_reads_secret_file_reference() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("mx20022-secret-{now}.txt"));
+        fs::write(&path, "file-secret\n").expect("write secret file");
+
+        let config = format!(
+            r#"{BASE_CONFIG}
+[runtime.admin_auth]
+mode = "jwt_hs256"
+jwt_hs256_secret = "secret://{}"
+"#,
+            path.display()
+        );
+        let parsed = RuntimeConfig::parse(&config).expect("config should parse");
+        assert_eq!(
+            parsed.runtime.admin_auth.jwt_hs256_secret.as_deref(),
+            Some("file-secret")
+        );
+
+        let _ = fs::remove_file(path);
     }
 }

@@ -2,15 +2,15 @@ use std::sync::Arc;
 
 use axum::extract::{Path, State};
 use axum::http::header::{
-    CONTENT_SECURITY_POLICY, REFERRER_POLICY, STRICT_TRANSPORT_SECURITY, X_CONTENT_TYPE_OPTIONS,
-    X_FRAME_OPTIONS,
+    AUTHORIZATION, CONTENT_SECURITY_POLICY, CONTENT_TYPE, REFERRER_POLICY,
+    STRICT_TRANSPORT_SECURITY, X_CONTENT_TYPE_OPTIONS, X_FRAME_OPTIONS,
 };
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::middleware::map_response;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::CorsLayer;
 
 use crate::auth::{authorize_request, AdminResource, AuthConfig, AuthError};
 use crate::controller::{AdminController, AdminControllerError};
@@ -29,7 +29,7 @@ pub async fn serve(
     controller: Arc<dyn AdminController>,
     auth: AuthConfig,
 ) -> Result<(), HostError> {
-    serve_with_tls(addr, controller, auth, None).await
+    serve_with_tls_and_cors(addr, controller, auth, None, Vec::new()).await
 }
 
 pub async fn serve_with_tls(
@@ -37,6 +37,16 @@ pub async fn serve_with_tls(
     controller: Arc<dyn AdminController>,
     auth: AuthConfig,
     tls: Option<TlsConfig>,
+) -> Result<(), HostError> {
+    serve_with_tls_and_cors(addr, controller, auth, tls, Vec::new()).await
+}
+
+pub async fn serve_with_tls_and_cors(
+    addr: &str,
+    controller: Arc<dyn AdminController>,
+    auth: AuthConfig,
+    tls: Option<TlsConfig>,
+    allowed_origins: Vec<String>,
 ) -> Result<(), HostError> {
     let state = HostState { controller, auth };
 
@@ -47,12 +57,7 @@ pub async fn serve_with_tls(
         .route("/reload", post(reload_config))
         .route("/tx/:tx_id", get(get_tx))
         .route("/metrics", get(get_metrics))
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods([Method::GET, Method::POST])
-                .allow_headers(Any),
-        )
+        .layer(build_cors_layer(&allowed_origins))
         .layer(map_response(add_security_headers))
         .layer(axum::extract::DefaultBodyLimit::max(MAX_ADMIN_BODY_BYTES))
         .with_state(state);
@@ -83,6 +88,25 @@ pub async fn serve_with_tls(
             .await
             .map_err(|e| HostError::Serve(e.to_string()))
     }
+}
+
+fn build_cors_layer(allowed_origins: &[String]) -> CorsLayer {
+    let mut layer = CorsLayer::new()
+        .allow_methods([Method::GET, Method::POST])
+        .allow_headers([
+            AUTHORIZATION,
+            CONTENT_TYPE,
+            HeaderName::from_static("x-client-cert-subject"),
+        ]);
+
+    let parsed_origins = allowed_origins
+        .iter()
+        .filter_map(|origin| HeaderValue::from_str(origin).ok())
+        .collect::<Vec<_>>();
+    if !parsed_origins.is_empty() {
+        layer = layer.allow_origin(parsed_origins);
+    }
+    layer
 }
 
 async fn add_security_headers(mut response: axum::response::Response) -> axum::response::Response {

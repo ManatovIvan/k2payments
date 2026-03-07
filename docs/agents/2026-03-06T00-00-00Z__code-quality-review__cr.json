@@ -1,0 +1,95 @@
+{
+  "metadata": {
+    "task_short": "code-quality-review",
+    "agent_abbr": "cr",
+    "datetime_utc": "2026-03-06T00:00:00Z",
+    "filename": "2026-03-06T00-00-00Z__code-quality-review__cr.json",
+    "supersedes": null,
+    "version": "1.0"
+  },
+  "state": {
+    "objectives": [
+      "Full code quality and maintainability review of all Rust source files under crates/ and tests/",
+      "Assess: code smells, Rust idioms, documentation, SOLID/DRY, trait design, unsafe, async patterns, module organization"
+    ],
+    "constraints": [
+      "Read-only review — no code changes made",
+      "Cover all 54 .rs source files found"
+    ],
+    "important_facts": [
+      "Zero unsafe code found — clean sheet",
+      "Zero production unwrap() calls — all in tests only",
+      "No TODO/FIXME/HACK markers",
+      "Three panic!() calls found in non-test production code: SqliteStore::new lazy pool init, GrpcInboundChannel test helper, TcpInboundChannel test helper (two are in test helper functions, one is in production SqliteStore::new)",
+      "encode_time() is duplicated across 5 files: sqlite/lib.rs, postgres/lib.rs, rocksdb/lib.rs, admin/service.rs, cli/main.rs",
+      "update_expectation in both sqlite and postgres stores issues TWO separate UPDATE queries for state+matched_tx_id rather than one atomic UPDATE",
+      "store/sqlite tests_missing.rs is NOT wired in (missing mod declaration) — those tests never run",
+      "JwtClaims struct is duplicated identically between mx20022-admin/src/auth.rs and mx20022-channels/src/auth.rs",
+      "parse_bearer_token() is duplicated identically between those same two files",
+      "verify_mtls() logic is near-identical in both admin and channel auth",
+      "list_dead_letters does application-level pipeline filtering after fetching ALL rows from DB — no SQL WHERE clause on pipeline",
+      "TX-ID generation uses AtomicU64 + SystemTime millis — not guaranteed globally unique across restarts",
+      "RocksDbStore::list_context_entries does a full table scan with IteratorMode::Start, iterating all keys to find prefix matches",
+      "RocksDbStore::query does a full scan of all records — no index support",
+      "InboundChannel::shutdown() on HttpInboundChannel is a no-op — axum server cannot actually be stopped",
+      "MiddlewareStage::Authorization, RateLimit, ErrorTransform, StructuredLogging are all empty stubs in http.rs",
+      "SessionManager::connect() transitions through Connecting -> Authenticating -> Active synchronously with no actual I/O — the intermediate states are cosmetic",
+      "config/lib.rs AdminAuthSection default_admin_auth_mode returns 'legacy_bearer' — insecure default for production",
+      "StoreSection has no pool_size enforcement or connection limit documentation",
+      "Public API surface (Store trait, Participant trait, Context) has zero doc comments",
+      "ErrorResponseBuilder::build_error_xml uses format! string concatenation that could embed user-controlled tx_id into XML without escaping",
+      "AcknowledgementBuilder::commit builds XML without XML escaping tx_id",
+      "StatusResponseBuilder::build_status_xml also injects tx_id into XML without escaping",
+      "hash_bytes() uses DefaultHasher which is not stable across Rust versions/platforms — config version fingerprinting could change unexpectedly after toolchain upgrade",
+      "InboundMessage channel buffer hardcoded at 1024 in engine.rs line 115"
+    ],
+    "decisions_made": [
+      "Classified panic in SqliteStore::new as CRITICAL because it fires in production path, not test",
+      "Classified XML injection as CRITICAL because tx_id originates from untrusted inbound data in some paths",
+      "Classified update_expectation non-atomicity as HIGH because MATCHED state and matched_tx_id can diverge if process crashes between the two UPDATEs",
+      "Classified tests_missing.rs not-wired as HIGH because identified test gaps were explicitly noted as important coverage"
+    ],
+    "artifacts": [
+      "crates/mx20022-store/mx20022-store-sqlite/src/lib.rs:30-35 (panic in SqliteStore::new)",
+      "crates/mx20022-store/mx20022-store-sqlite/src/lib.rs:456-479 (non-atomic update_expectation)",
+      "crates/mx20022-participants/src/acknowledgement_builder.rs:39-44 (XML injection via tx_id)",
+      "crates/mx20022-participants/src/error_response_builder.rs:24-29 (XML injection via tx_id)",
+      "crates/mx20022-participants/src/status_response_builder.rs:28-32 (XML injection via tx_id)",
+      "crates/mx20022-store/mx20022-store-sqlite/src/tests_missing.rs (not wired into lib.rs)",
+      "crates/mx20022-admin/src/auth.rs + crates/mx20022-channels/src/auth.rs (duplicated JWT/bearer logic)",
+      "crates/mx20022-runtime/src/engine.rs:115 (hardcoded channel buffer 1024)",
+      "crates/mx20022-runtime/src/main.rs:252-256 (DefaultHasher for config versioning)"
+    ],
+    "dependencies": [],
+    "risks_issues": [
+      "XML injection via unescaped tx_id in response builders: OPEN",
+      "Non-atomic update_expectation: OPEN",
+      "panic in SqliteStore::new production path: OPEN",
+      "tests_missing.rs never executed: OPEN",
+      "RocksDB full-scan queries not scalable: OPEN",
+      "HttpInboundChannel shutdown is a no-op: OPEN"
+    ]
+  },
+  "iteration": {
+    "summary": "Read all 54 .rs source files across the k2payments workspace. The codebase is well-structured with clean Rust idioms, no unsafe code, and no production unwrap() calls. The 2PC transaction manager, state machine, context type map, and participant trait are solid abstractions. Key issues found: unescaped tx_id embedded into XML response strings (injection risk), a panic in the production SqliteStore::new path, non-atomic two-query update_expectation, substantial code duplication in auth logic and encode_time helpers, and a test file that is not wired into the build so its tests never run. RocksDB backend has full-table-scan implementations that will not scale. The auth default is insecure (legacy_bearer). Documentation for public APIs is absent.",
+    "inputs_consulted": [
+      "All 54 .rs files under /Volumes/Everything/Development/k2payments/crates/",
+      "All Cargo.toml files"
+    ],
+    "outputs_produced": [
+      "Structured review report delivered to user",
+      "This context JSON"
+    ],
+    "next_actions": [
+      "Fix XML injection in acknowledgement_builder, error_response_builder, status_response_builder",
+      "Make update_expectation atomic (single UPDATE with both columns)",
+      "Convert SqliteStore::new panic to Result<Self, StoreError>",
+      "Wire tests_missing.rs into lib.rs with #[cfg(test)] mod tests_missing",
+      "Extract encode_time and auth helpers into shared crates",
+      "Add doc comments to Store trait, Participant trait, Context public methods"
+    ]
+  },
+  "cross_agent_notes": {
+    "mentions": []
+  }
+}

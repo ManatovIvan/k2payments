@@ -1,0 +1,113 @@
+{
+  "metadata": {
+    "task_short": "code-quality-review",
+    "agent_abbr": "cr",
+    "datetime_utc": "2026-03-06T08:00:00Z",
+    "filename": "2026-03-06T08-00-00Z__code-quality-review__cr.json",
+    "supersedes": "2026-03-06T00-00-00Z__code-quality-review__cr.json",
+    "version": "1.0"
+  },
+  "state": {
+    "objectives": [
+      "Incremental code quality and maintainability review of all modified files in the feat/ci-validation-correlation branch"
+    ],
+    "constraints": [
+      "Read-only review — no code changes made",
+      "Prior cr pass (2026-03-06T00:00:00Z) already reviewed baseline; this pass focuses on the diff"
+    ],
+    "important_facts": [
+      "std::sync::RwLock replaced with tokio::sync::RwLock across app.rs -- good, eliminates blocking reads in async context",
+      "pipeline_count/pipeline_names/accepts_message_type now async -- correct but creates API surface change callers must track",
+      "XML injection in acknowledgement_builder, error_response_builder, status_response_builder FIXED via escape_xml()",
+      "escape_xml() is pub in mx20022-participants/src/lib.rs -- visibility wider than needed, should be pub(crate)",
+      "update_expectation FIXED to single COALESCE query in both sqlite and postgres -- atomicity issue resolved",
+      "batch_append_context_entries added to Store trait with default fallback impl -- good design",
+      "CryptoService Debug impl now redacts key_bytes -- fixes H-2 from security audit",
+      "KDF upgraded from raw SHA-256 to HKDF-SHA256 with salt b'mx20022-v1' -- fixes H-1 from security audit",
+      "HKDF salt is a static compile-time constant b'mx20022-v1', not per-key -- this is a context/info param not a salt, acceptable for HKDF but worth noting",
+      "Default admin_auth_mode changed from legacy_bearer to disabled -- fixes insecure default",
+      "legacy_bearer now emits tracing::warn at config load time -- good operational signal",
+      "Internal error messages no longer forwarded to HTTP/gRPC clients (map_error_to_status, map_error, map_controller_error all fixed) -- fixes H-4",
+      "DB URL removed from health details response -- fixes H-3 DB URL leak",
+      "MAX_FRAME_SIZE = 10 * 1024 * 1024 (10 MiB) hardcoded constant for TCP -- fixes TCP OOM CRITICAL from security audit",
+      "TCP delimiter path uses .take(MAX_FRAME_SIZE + 1) -- off-by-one is intentional to detect oversize without allocating full excess",
+      "TCP delimiter check: buf.last() != Some(delimiter) && buf.len() > MAX_FRAME_SIZE -- logic is correct but subtle; a 10MiB frame ending exactly on delimiter passes (correct behavior)",
+      "const MAX_FRAME_SIZE placed AFTER the function that uses it (line 226 after process_connection ends at 224) -- compiles due to Rust const hoisting but unconventional placement",
+      "HTTP body limit added: DefaultBodyLimit::max(10 * 1024 * 1024) in both admin host.rs and channel http lib.rs -- magic number, not named constant",
+      "TLS added to admin HTTP and gRPC servers via axum-server/rustls and tonic tls feature -- positive",
+      "TlsConfig struct duplicated: host::TlsConfig and grpc::GrpcTlsConfig are structurally identical (cert_path, key_path) -- DRY violation",
+      "build_admin_http_tls and build_admin_grpc_tls in main.rs are near-identical functions differing only in return type -- DRY violation",
+      "RocksDB list_context_entries fixed from full Start scan to prefix-bounded Direction::Forward scan -- performance fix",
+      "RocksDB query() still does full 'tx:' prefix scan with in-memory filtering -- no SQL-style index, unavoidable for RocksDB but undocumented",
+      "SqliteStore::new still has panic!() on lazy pool creation failure -- CRITICAL from prior pass, NOT fixed in this diff",
+      "spawn_participant_reload_watcher uses std::sync::RwLock (not tokio) for reload_status -- inconsistent with app.rs migration to tokio RwLock; reload_status write() is called in async context after .await which blocks the thread",
+      "AppConfigReloader::reload also uses std::sync::RwLock::write() in async context for same reload_status -- same blocking-in-async issue",
+      "tests_missing.rs wired in sqlite/src/lib.rs line 13 as `mod tests_missing;` -- prior issue FIXED",
+      "New e2e test in crates/mx20022-runtime/tests/e2e_pipeline.rs exercises full pipeline commit path",
+      "PostgreSQL integration tests in store-postgres/src/lib.rs use connect_or_skip() pattern -- correct skip-if-no-env approach",
+      "Clippy added to CI: cargo clippy --workspace -- -D warnings -- addresses prior gap",
+      "cargo deny added to CI with cargo install cargo-deny --locked -- deny.toml has unlicensed removed, now just allow-list",
+      "deny.toml dropped `unlicensed = 'deny'` -- this was the safe default; now unlicensed crates silently pass unless caught by confidence-threshold",
+      "hash_bytes still uses DefaultHasher -- not fixed, still non-stable across toolchain upgrades",
+      "escape_xml allocates 5 intermediate Strings via chained replace() -- minor but worth noting for hot path",
+      "lib.rs created for mx20022-runtime, re-exporting app/application/domain/engine modules as pub -- main.rs now consumes as external crate user, correct refactor"
+    ],
+    "decisions_made": [
+      "Classified std::sync::RwLock in async context as CRITICAL: blocking .write() after .await can starve tokio threads in reload_status watcher and AppConfigReloader",
+      "Classified TlsConfig duplication as RECOMMEND: two identical structs in the same binary is noise, not a correctness issue",
+      "Classified SqliteStore::new panic as still CRITICAL: unchanged from prior pass",
+      "Classified deny.toml unlicensed removal as RECOMMEND: was a safe gate, removal is a regression in supply chain posture",
+      "Classified escape_xml pub visibility as SUGGEST: should be pub(crate) unless intentionally part of public API",
+      "Classified MAX_FRAME_SIZE and body limit magic numbers as SUGGEST: should be named constants"
+    ],
+    "artifacts": [
+      "crates/mx20022-runtime/src/main.rs:228-230 (std::sync::RwLock::write in async context)",
+      "crates/mx20022-runtime/src/main.rs:243-245 (same, error branch)",
+      "crates/mx20022-runtime/src/main.rs:373-375 (AppConfigReloader::reload same issue)",
+      "crates/mx20022-runtime/src/main.rs:261-293 (build_admin_http_tls / build_admin_grpc_tls duplication)",
+      "crates/mx20022-admin/src/host.rs:19-22 (host::TlsConfig)",
+      "crates/mx20022-admin/src/grpc.rs:143-146 (GrpcTlsConfig -- identical fields)",
+      "crates/mx20022-store/mx20022-store-sqlite/src/lib.rs:30-35 (panic in SqliteStore::new -- UNFIXED)",
+      "crates/mx20022-participants/src/lib.rs:3 (escape_xml pub visibility)",
+      "crates/mx20022-channels/mx20022-channel-tcp/src/lib.rs:226 (MAX_FRAME_SIZE declared after first use function)",
+      "deny.toml:1 (unlicensed = deny removed)"
+    ],
+    "dependencies": [],
+    "risks_issues": [
+      "std::sync::RwLock::write() in async context in reload watcher and AppConfigReloader: OPEN (NEW CRITICAL)",
+      "SqliteStore::new panic in production path: OPEN (CARRY-FORWARD)",
+      "TlsConfig struct/function duplication: OPEN (new RECOMMEND)",
+      "deny.toml unlicensed gate removed: OPEN (new RECOMMEND)",
+      "hash_bytes DefaultHasher instability: OPEN (carry-forward, low priority)",
+      "escape_xml pub visibility: OPEN (new SUGGEST)",
+      "HTTP/TCP body limit magic numbers not named: OPEN (new SUGGEST)"
+    ]
+  },
+  "iteration": {
+    "summary": "Reviewed the full diff for feat/ci-validation-correlation against HEAD. The branch closes multiple prior CRITICAL and HIGH findings: XML injection fixed, update_expectation atomicity fixed, KDF upgraded to HKDF, Debug key leak fixed, internal error messages suppressed, DB URL removed from health, TCP OOM fixed with MAX_FRAME_SIZE, default auth mode made safe. One new CRITICAL introduced: std::sync::RwLock::write() is called in async context (inside spawn_participant_reload_watcher and AppConfigReloader::reload) which can block tokio threads. The SqliteStore::new panic remains unfixed. Two DRY issues added: TlsConfig struct duplication and build_admin_http/grpc_tls function duplication. The deny.toml change silently removed the unlicensed=deny gate.",
+    "inputs_consulted": [
+      "git diff HEAD for all 26 modified files",
+      "Full reads of main.rs, lib.rs, app.rs (runtime), crypto/lib.rs, participants/lib.rs, tcp/lib.rs, sqlite/lib.rs (partial), config/lib.rs (partial), deny.toml, e2e_pipeline.rs",
+      "Prior cr context: 2026-03-06T00-00-00Z__code-quality-review__cr.json",
+      "Prior sec context: 2026-03-06T00-01-00Z__security-audit__sec.json"
+    ],
+    "outputs_produced": [
+      "Structured incremental review report delivered to user",
+      "This context JSON"
+    ],
+    "next_actions": [
+      "Fix std::sync::RwLock in async context: replace reload_status with tokio::sync::RwLock or move writes to a dedicated blocking task",
+      "Fix SqliteStore::new panic: return Result<Self, StoreError>",
+      "Deduplicate TlsConfig into a shared admin crate type",
+      "Restore unlicensed = 'deny' in deny.toml or document the intentional change",
+      "Make escape_xml pub(crate) if not intended as public API",
+      "Name the 10 MiB constants: MAX_HTTP_BODY_SIZE, MAX_TCP_FRAME_SIZE"
+    ]
+  },
+  "cross_agent_notes": {
+    "mentions": [
+      {"agent_abbr": "sec", "filename": "2026-03-06T00-01-00Z__security-audit__sec.json", "relevance_note": "C-1 TCP OOM fixed; H-1 KDF fixed; H-2 Debug leak fixed; H-3 DB URL fixed; H-4 internal error forwarding fixed"},
+      {"agent_abbr": "ar", "filename": "2026-03-06T00-00-00Z__arch-review__ar.json", "relevance_note": "No clippy in CI: now fixed. Duplicate Outcome enum: not addressed in this diff."}
+    ]
+  }
+}

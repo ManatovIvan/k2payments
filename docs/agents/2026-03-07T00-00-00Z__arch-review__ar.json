@@ -1,0 +1,83 @@
+{
+  "metadata": {
+    "task_short": "arch-review",
+    "agent_abbr": "ar",
+    "datetime_utc": "2026-03-07T00:00:00Z",
+    "filename": "2026-03-07T00-00-00Z__arch-review__ar.json",
+    "supersedes": "2026-03-06T12-00-00Z__arch-review__ar.json",
+    "version": "1.0"
+  },
+  "state": {
+    "objectives": [
+      "Comprehensive architecture review of mx20022 22-crate workspace",
+      "Evaluate crate boundaries, dependency direction, trait abstractions, SOLID compliance, PRD alignment"
+    ],
+    "constraints": ["Rust workspace with 22 crates", "Feature-gated channel and store backends", "ISO 20022 financial messaging runtime"],
+    "important_facts": [
+      "Clean DAG dependency graph - no circular dependencies confirmed via cargo tree",
+      "22 crates total: runtime-core, runtime, channels (7 impls), store (3 impls), participants, correlation, session, config, metrics, admin, crypto, cli",
+      "Dependency direction is correct: lower-level crates (runtime-core, store, channels) have no upward dependencies",
+      "runtime-core depends only on mx20022-metrics - slight concern about metrics coupling in core",
+      "Duplicate Outcome enum exists in mx20022-store and mx20022-runtime-core",
+      "build_participants in app.rs is a ~200-line match factory - OCP violation",
+      "Engine owns all channel construction in a massive match block - another OCP violation",
+      "main.rs has 7-way if/else chain for service mode combinations (pipeline/admin-http/admin-grpc)",
+      "Session crate is structurally isolated - no consumer in the workspace",
+      "CorrelationEngine uses single RwLock HashMap - write contention under load",
+      "Store default implementations load all records to count them (count_dead_letters, count_pending_expectations)",
+      "TransactionManager has no timeout enforcement - PRD requires timeout_ms per pipeline",
+      "No outbound channel integration in the engine - only inbound channels are wired",
+      "No Context Space (typed map) for parsed messages - PRD shows ctx.message() returning parsed type",
+      "State strings used for store layer instead of enum - stringly-typed boundary",
+      "InboundMessage/OutboundMessage are bare String wrappers with no metadata"
+    ],
+    "decisions_made": [],
+    "artifacts": [
+      "All Cargo.toml files across 22 crates",
+      "crates/mx20022-runtime-core/src/ (lib.rs, context.rs, participant.rs, state.rs, transaction_manager.rs)",
+      "crates/mx20022-runtime/src/ (lib.rs, app.rs, engine.rs, main.rs, domain.rs, application.rs)",
+      "crates/mx20022-channels/src/ (lib.rs, auth.rs)",
+      "crates/mx20022-store/src/lib.rs",
+      "crates/mx20022-store/mx20022-store-sqlite/src/lib.rs",
+      "crates/mx20022-correlation/src/lib.rs",
+      "crates/mx20022-session/src/lib.rs",
+      "crates/mx20022-config/src/lib.rs",
+      "crates/mx20022-admin/src/ (lib.rs, controller.rs, service.rs, dto.rs)",
+      "crates/mx20022-metrics/src/lib.rs",
+      "crates/mx20022-crypto/src/lib.rs",
+      "crates/mx20022-participants/src/lib.rs",
+      "crates/mx20022-channels/mx20022-channel-http/src/lib.rs",
+      "prd.md"
+    ],
+    "dependencies": [],
+    "risks_issues": [
+      "CRITICAL: No outbound channel wiring - engine only processes inbound, never sends responses",
+      "CRITICAL: No pipeline timeout enforcement despite PRD requirement and config field",
+      "CRITICAL: Duplicate Outcome enum creates mapping layer that adds no value",
+      "HIGH: build_participants factory violates OCP - every new participant requires modifying app.rs",
+      "HIGH: CorrelationEngine single-node only - RwLock HashMap does not scale horizontally",
+      "HIGH: Store trait is too broad - 20+ methods mixing transaction, correlation, dead-letter concerns",
+      "MEDIUM: Session crate is orphaned - no integration point in any other crate",
+      "MEDIUM: main.rs combinatorial explosion for service modes",
+      "MEDIUM: No graceful shutdown orchestration across channels/store/correlation"
+    ]
+  },
+  "iteration": {
+    "summary": "Completed comprehensive architecture review of the full 22-crate mx20022 payments runtime workspace. Read all key source files, dependency graphs, and the full PRD. Identified clean DAG structure and well-designed core abstractions (Participant trait, Store trait, Channel traits). Found critical gaps: no outbound channel integration, no pipeline timeout enforcement, duplicate Outcome enum, OCP violations in participant/channel factories. Correlation engine is single-node only. Session crate is orphaned. Store trait is overloaded. PRD alignment has significant gaps in v0.1 scope.",
+    "inputs_consulted": [
+      "prd.md",
+      "All 22 Cargo.toml files",
+      "All key src/lib.rs and core source files",
+      "cargo tree output"
+    ],
+    "outputs_produced": ["Full structured architecture review report"],
+    "next_actions": []
+  },
+  "cross_agent_notes": {
+    "mentions": [
+      {"agent_abbr": "cr", "filename": "2026-03-06T08-00-00Z__code-quality-review__cr.json", "relevance_note": "Code quality findings overlap with OCP violation and factory pattern issues"},
+      {"agent_abbr": "sec", "filename": "2026-03-06T20-00-00Z__security-audit__sec.json", "relevance_note": "Auth architecture in channels and admin crates"},
+      {"agent_abbr": "perf", "filename": "2026-03-06T00-00-00Z__perf-analysis__perf.json", "relevance_note": "CorrelationEngine RwLock contention and Store default impl performance"}
+    ]
+  }
+}

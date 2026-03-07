@@ -2,6 +2,7 @@ use std::collections::HashSet;
 
 use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 use serde::Deserialize;
+use subtle::ConstantTimeEq;
 
 use crate::ChannelError;
 
@@ -94,7 +95,7 @@ pub fn authorize_inbound(
                 .bearer_token
                 .as_deref()
                 .ok_or_else(|| ChannelError::new("inbound auth is misconfigured"))?;
-            if token == expected {
+            if constant_time_eq(token, expected) {
                 Ok(())
             } else {
                 Err(ChannelError::new("invalid bearer token"))
@@ -195,12 +196,29 @@ pub fn parse_bearer_token(header: Option<&str>) -> Option<&str> {
     Some(token)
 }
 
+pub fn constant_time_eq(left: &str, right: &str) -> bool {
+    let left = left.as_bytes();
+    let right = right.as_bytes();
+    let max_len = left.len().max(right.len());
+
+    let mut left_padded = vec![0_u8; max_len];
+    let mut right_padded = vec![0_u8; max_len];
+    left_padded[..left.len()].copy_from_slice(left);
+    right_padded[..right.len()].copy_from_slice(right);
+
+    let content_eq = left_padded.ct_eq(&right_padded);
+    let len_eq = (left.len() as u64).ct_eq(&(right.len() as u64));
+    bool::from(content_eq & len_eq)
+}
+
 #[cfg(test)]
 mod tests {
     use jsonwebtoken::{encode, EncodingKey, Header};
     use serde::Serialize;
 
-    use super::{authorize_inbound, InboundAuthConfig, InboundAuthContext, InboundAuthMode};
+    use super::{
+        authorize_inbound, constant_time_eq, InboundAuthConfig, InboundAuthContext, InboundAuthMode,
+    };
 
     #[derive(Debug, Serialize)]
     struct Claims {
@@ -234,6 +252,11 @@ mod tests {
             },
         );
         assert!(denied.is_err());
+    }
+
+    #[test]
+    fn constant_time_eq_handles_length_mismatch() {
+        assert!(!constant_time_eq("short", "a-very-different-length"));
     }
 
     #[test]

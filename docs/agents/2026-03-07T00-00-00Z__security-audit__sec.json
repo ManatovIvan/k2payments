@@ -1,0 +1,79 @@
+{
+  "metadata": {
+    "task_short": "security-audit",
+    "agent_abbr": "sec",
+    "datetime_utc": "2026-03-07T00:00:00Z",
+    "filename": "2026-03-07T00-00-00Z__security-audit__sec.json",
+    "supersedes": "2026-03-06T20-00-00Z__security-audit__sec.json",
+    "version": "1.0"
+  },
+  "state": {
+    "objectives": [
+      "Full security audit of MX20022 payments runtime workspace post-remediation commit 70f8383",
+      "Cover OWASP Top 10, crypto, auth, input validation, CI supply chain, TLS, rate limiting"
+    ],
+    "constraints": ["Rust workspace, no unsafe blocks found in crate source"],
+    "important_facts": [
+      "CRITICAL: CryptoService HKDF salt derived from master_key itself (SHA-256 of master_key used as salt) - circular derivation reduces KDF security",
+      "CRITICAL: Bearer token comparisons (legacy auth + static bearer channel auth) use non-constant-time == operator - timing side-channel risk",
+      "HIGH: CORS allows Any origin on admin host AND HTTP inbound channel - credential-bearing endpoints exposed to cross-origin attacks",
+      "HIGH: JWT HS256 secret stored as plaintext String in config structs in memory - no zeroization on drop",
+      "HIGH: TCP channel auth_token compared with non-constant-time != operator",
+      "HIGH: No TLS enforcement on any channel (HTTP, gRPC, TCP, Kafka, AMQP, NATS) - all listen plaintext by default",
+      "HIGH: Admin auth defaults to Disabled mode - no auth unless explicitly configured",
+      "HIGH: Channel inbound auth defaults to Disabled mode - no auth unless explicitly configured",
+      "MEDIUM: Example config docs/examples/basic.toml ships jwt_hs256_secret = 'replace-me' - trivially guessable placeholder",
+      "MEDIUM: Config file stores secrets (jwt_hs256_secret, legacy_bearer_token, auth_bearer_token, auth_jwt_hs256_secret) in plaintext TOML",
+      "MEDIUM: Kafka consumer uses enable.auto.commit=true - message loss risk on crash",
+      "MEDIUM: Store URL (may contain DB credentials) passed as plaintext string through config",
+      "MEDIUM: RocksDB store uses from_utf8_lossy for key comparison - silent data corruption possible",
+      "MEDIUM: No rate limiting on admin endpoints (middleware RateLimit stage is a no-op)",
+      "LOW: deny.toml ignores RUSTSEC-2024-0384 and RUSTSEC-2025-0134 advisories",
+      "LOW: CI workflow uses dtolnay/rust-toolchain@stable without SHA pinning",
+      "LOW: CI uses Swatinem/rust-cache@v2 without SHA pinning",
+      "LOW: File channel does not validate path traversal in pattern matching",
+      "INFO: No unsafe blocks in any crate source code",
+      "INFO: All SQL queries use parameterized bindings (no SQL injection risk)",
+      "INFO: Security headers (HSTS, CSP, X-Frame-Options, nosniff, Referrer-Policy, Permissions-Policy) added to admin and HTTP channel",
+      "INFO: Body size limits applied (10MB max on admin and HTTP channel)",
+      "INFO: Secrets redacted from Debug output on AuthConfig and InboundAuthConfig",
+      "INFO: CryptoService key_bytes zeroed on Drop"
+    ],
+    "decisions_made": [],
+    "artifacts": ["docs/agents/2026-03-07T00-00-00Z__security-audit__sec.json"],
+    "dependencies": [],
+    "risks_issues": [
+      "Timing side-channel on token comparison in production payment auth paths",
+      "Default-disabled auth means misconfiguration leads to unauthenticated access",
+      "No TLS enforcement means network eavesdropping of payment messages is possible",
+      "CORS Any origin on credential endpoints enables CSRF-like attacks"
+    ]
+  },
+  "iteration": {
+    "summary": "Completed comprehensive re-audit of all crates post-remediation commit 70f8383. Previous CRITICAL finding (hardcoded static HKDF salt) was partially fixed - salt is now SHA-256 of master_key, but this is a circular derivation that does not add independent entropy. Previous HIGH finding (legacy bearer accepts any non-empty token) was fully fixed - now requires explicit token configuration. Security headers and body limits were added. However, new and remaining findings include: timing side-channel on all token comparisons, CORS wildcard on credential endpoints, default-disabled auth on all paths, no TLS enforcement on channels, plaintext secrets in config, and CI action pinning gaps. Total: 2 CRITICAL, 6 HIGH, 6 MEDIUM, 4 LOW, 5 INFORMATIONAL findings.",
+    "inputs_consulted": [
+      "All .rs files under crates/",
+      "Cargo.toml, Cargo.lock, deny.toml",
+      ".github/workflows/ci.yml",
+      "docs/examples/basic.toml",
+      ".gitignore"
+    ],
+    "outputs_produced": ["Full security audit report", "Agent context JSON"],
+    "next_actions": [
+      "Use constant_time_eq (from subtle crate) for all token/secret comparisons",
+      "Restrict CORS to explicit allowed origins or remove Any",
+      "Add independent salt to HKDF (e.g., random per-deployment salt stored alongside config)",
+      "Implement zeroize for JWT secrets in config structs",
+      "Add startup warning/error when auth is disabled in non-dev environments",
+      "Enforce TLS or document network isolation requirements per channel",
+      "Support env var / secret manager references in config instead of plaintext secrets",
+      "Pin CI actions to SHA digests"
+    ]
+  },
+  "cross_agent_notes": {
+    "mentions": [
+      {"agent_abbr": "ar", "filename": "2026-03-06T12-00-00Z__arch-review__ar.json", "relevance_note": "Architecture decisions on auth defaults and channel security posture are security-relevant"},
+      {"agent_abbr": "ta", "filename": "2026-03-06T21-30-00Z__test-coverage-audit__ta.json", "relevance_note": "Missing security test coverage for timing attacks and CORS behavior"}
+    ]
+  }
+}

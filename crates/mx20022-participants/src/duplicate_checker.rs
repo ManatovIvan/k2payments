@@ -43,38 +43,86 @@ impl DuplicateChecker {
         tx_id: &str,
         xml: &str,
     ) -> Result<Option<(DuplicateKey, String)>, ParticipantError> {
+        let check_message_id = self.keys.contains(&DuplicateKey::MessageId).then(|| {
+            extract_element(xml, "BizMsgIdr")
+                .or_else(|| extract_element(xml, "MsgId"))
+                .map(ToString::to_string)
+        });
+        let check_end_to_end_id = self
+            .keys
+            .contains(&DuplicateKey::EndToEndId)
+            .then(|| extract_element(xml, "EndToEndId").map(ToString::to_string));
+        let check_uetr = self
+            .keys
+            .contains(&DuplicateKey::Uetr)
+            .then(|| extract_element(xml, "UETR").map(ToString::to_string));
+
+        let (message_id_records, end_to_end_records, uetr_records) = tokio::join!(
+            async {
+                if let Some(Some(value)) = check_message_id.as_ref() {
+                    self.store
+                        .find_by_message_id(value)
+                        .await
+                        .map(Some)
+                        .map_err(|e| ParticipantError::new(format!("duplicate-checker: {e}")))
+                } else {
+                    Ok(None)
+                }
+            },
+            async {
+                if let Some(Some(value)) = check_end_to_end_id.as_ref() {
+                    self.store
+                        .find_by_end_to_end_id(value)
+                        .await
+                        .map(Some)
+                        .map_err(|e| ParticipantError::new(format!("duplicate-checker: {e}")))
+                } else {
+                    Ok(None)
+                }
+            },
+            async {
+                if let Some(Some(value)) = check_uetr.as_ref() {
+                    self.store
+                        .find_by_uetr(value)
+                        .await
+                        .map(Some)
+                        .map_err(|e| ParticipantError::new(format!("duplicate-checker: {e}")))
+                } else {
+                    Ok(None)
+                }
+            }
+        );
+
+        let message_id_records = message_id_records?;
+        let end_to_end_records = end_to_end_records?;
+        let uetr_records = uetr_records?;
+
         for key in &self.keys {
             match key {
                 DuplicateKey::MessageId => {
-                    if let Some(value) =
-                        extract_element(xml, "BizMsgIdr").or_else(|| extract_element(xml, "MsgId"))
+                    if let (Some(Some(value)), Some(records)) =
+                        (check_message_id.as_ref(), message_id_records.as_ref())
                     {
-                        let existing = self.store.find_by_message_id(value).await.map_err(|e| {
-                            ParticipantError::new(format!("duplicate-checker: {e}"))
-                        })?;
-                        if existing.iter().any(|record| record.tx_id != tx_id) {
-                            return Ok(Some((DuplicateKey::MessageId, value.to_string())));
+                        if records.iter().any(|record| record.tx_id != tx_id) {
+                            return Ok(Some((DuplicateKey::MessageId, value.clone())));
                         }
                     }
                 }
                 DuplicateKey::EndToEndId => {
-                    if let Some(value) = extract_element(xml, "EndToEndId") {
-                        let existing =
-                            self.store.find_by_end_to_end_id(value).await.map_err(|e| {
-                                ParticipantError::new(format!("duplicate-checker: {e}"))
-                            })?;
-                        if existing.iter().any(|record| record.tx_id != tx_id) {
-                            return Ok(Some((DuplicateKey::EndToEndId, value.to_string())));
+                    if let (Some(Some(value)), Some(records)) =
+                        (check_end_to_end_id.as_ref(), end_to_end_records.as_ref())
+                    {
+                        if records.iter().any(|record| record.tx_id != tx_id) {
+                            return Ok(Some((DuplicateKey::EndToEndId, value.clone())));
                         }
                     }
                 }
                 DuplicateKey::Uetr => {
-                    if let Some(value) = extract_element(xml, "UETR") {
-                        let existing = self.store.find_by_uetr(value).await.map_err(|e| {
-                            ParticipantError::new(format!("duplicate-checker: {e}"))
-                        })?;
-                        if existing.iter().any(|record| record.tx_id != tx_id) {
-                            return Ok(Some((DuplicateKey::Uetr, value.to_string())));
+                    if let (Some(Some(value)), Some(records)) =
+                        (check_uetr.as_ref(), uetr_records.as_ref())
+                    {
+                        if records.iter().any(|record| record.tx_id != tx_id) {
+                            return Ok(Some((DuplicateKey::Uetr, value.clone())));
                         }
                     }
                 }

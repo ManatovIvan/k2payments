@@ -1947,6 +1947,7 @@ dependencies = [
  "protoc-bin-vendored",
  "serde",
  "serde_json",
+ "subtle",
  "thiserror 1.0.69",
  "tokio",
  "tokio-rustls",
@@ -2049,6 +2050,7 @@ dependencies = [
  "jsonwebtoken",
  "serde",
  "serde_json",
+ "subtle",
  "thiserror 1.0.69",
  "tokio",
 ]
@@ -2234,6 +2236,7 @@ dependencies = [
  "mx20022-store",
  "rocksdb",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
 ]

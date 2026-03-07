@@ -10,6 +10,13 @@ use mx20022_store::{
 use rocksdb::{Direction, IteratorMode, Options, WriteBatch, DB};
 use serde_json::{json, Map, Value};
 
+const TX_PREFIX: &str = "tx:";
+const IDX_STATE_PREFIX: &str = "idx:state:";
+const IDX_PIPELINE_PREFIX: &str = "idx:pipeline:";
+const IDX_MESSAGE_TYPE_PREFIX: &str = "idx:message_type:";
+const IDX_KEY_PREFIX: &str = "idx:key:";
+const INDEX_SEP: &str = "\0";
+
 pub struct RocksDbStore {
     path: String,
     db: Arc<DB>,
@@ -37,9 +44,27 @@ impl RocksDbStore {
 impl Store for RocksDbStore {
     async fn begin_transaction(&self, record: &TransactionRecord) -> Result<(), StoreError> {
         let db = Arc::clone(&self.db);
-        let value = transaction_to_value(record);
-        let key = format!("tx:{}", record.tx_id);
-        run_blocking(move || put_value(&db, &key, &value)).await
+        let record = record.clone();
+        run_blocking(move || {
+            let tx_key = tx_key(&record.tx_id);
+            let value = transaction_to_value(&record);
+            let existing = load_tx_by_id(&db, &record.tx_id)?;
+
+            let mut batch = WriteBatch::default();
+            if let Some(existing) = existing.as_ref() {
+                remove_transaction_indexes(&mut batch, existing);
+            }
+
+            let data = serde_json::to_vec(&value)
+                .map_err(|e| StoreError::new(format!("value encode failed: {e}")))?;
+            batch.put(tx_key.as_bytes(), data);
+            insert_transaction_indexes(&mut batch, &record);
+
+            db.write(batch)
+                .map_err(|e| StoreError::new(format!("rocksdb batch write failed: {e}")))?;
+            Ok(())
+        })
+        .await
     }
 
     async fn update_transaction(
@@ -173,7 +198,7 @@ impl Store for RocksDbStore {
 
     async fn find_by_id(&self, tx_id: &str) -> Result<Option<TransactionRecord>, StoreError> {
         let db = Arc::clone(&self.db);
-        let key = format!("tx:{tx_id}");
+        let key = tx_key(tx_id);
         run_blocking(move || {
             let raw = db
                 .get(key)
@@ -209,47 +234,58 @@ impl Store for RocksDbStore {
         let db = Arc::clone(&self.db);
         run_blocking(move || {
             let mut records = Vec::new();
-            let prefix = "tx:";
-            for item in db.iterator(IteratorMode::From(prefix.as_bytes(), Direction::Forward)) {
-                let (key, value) =
-                    item.map_err(|e| StoreError::new(format!("rocksdb iterator failed: {e}")))?;
-                let key_str = String::from_utf8_lossy(&key);
-                if !key_str.starts_with(prefix) {
-                    break;
-                }
-                let value: Value = serde_json::from_slice(&value)
-                    .map_err(|e| StoreError::new(format!("transaction decode failed: {e}")))?;
-                let record = transaction_from_value(&value)?;
+            let index_prefix = filter
+                .state
+                .as_ref()
+                .map(|state| index_state_prefix(state))
+                .or_else(|| {
+                    filter
+                        .pipeline
+                        .as_ref()
+                        .map(|pipeline| index_pipeline_prefix(pipeline))
+                })
+                .or_else(|| {
+                    filter
+                        .message_type
+                        .as_ref()
+                        .map(|message_type| index_message_type_prefix(message_type))
+                });
 
-                if let Some(ref pipeline) = filter.pipeline {
-                    if &record.pipeline != pipeline {
-                        continue;
+            if let Some(prefix) = index_prefix {
+                for tx_id in tx_ids_for_prefix(&db, &prefix)? {
+                    if let Some(record) = load_tx_by_id(&db, &tx_id)? {
+                        if !record_matches_filter(&record, &filter) {
+                            continue;
+                        }
+                        records.push(record);
+                        if let Some(limit) = filter.limit {
+                            if records.len() >= limit {
+                                break;
+                            }
+                        }
                     }
                 }
-                if let Some(ref message_type) = filter.message_type {
-                    if &record.message_type != message_type {
-                        continue;
-                    }
-                }
-                if let Some(ref state) = filter.state {
-                    if &record.state != state {
-                        continue;
-                    }
-                }
-                if let Some(since) = filter.since {
-                    if record.received_at < since {
-                        continue;
-                    }
-                }
-                if let Some(until) = filter.until {
-                    if record.received_at > until {
-                        continue;
-                    }
-                }
-                records.push(record);
-                if let Some(limit) = filter.limit {
-                    if records.len() >= limit {
+            } else {
+                for item in
+                    db.iterator(IteratorMode::From(TX_PREFIX.as_bytes(), Direction::Forward))
+                {
+                    let (key, value) =
+                        item.map_err(|e| StoreError::new(format!("rocksdb iterator failed: {e}")))?;
+                    let key_str = String::from_utf8_lossy(&key);
+                    if !key_str.starts_with(TX_PREFIX) {
                         break;
+                    }
+                    let value: Value = serde_json::from_slice(&value)
+                        .map_err(|e| StoreError::new(format!("transaction decode failed: {e}")))?;
+                    let record = transaction_from_value(&value)?;
+                    if !record_matches_filter(&record, &filter) {
+                        continue;
+                    }
+                    records.push(record);
+                    if let Some(limit) = filter.limit {
+                        if records.len() >= limit {
+                            break;
+                        }
                     }
                 }
             }
@@ -424,23 +460,123 @@ async fn find_by_key_field(
     let value = value.to_string();
     run_blocking(move || {
         let mut out = Vec::new();
-        let prefix = "tx:";
-        for item in db.iterator(IteratorMode::From(prefix.as_bytes(), Direction::Forward)) {
-            let (key, val) =
-                item.map_err(|e| StoreError::new(format!("rocksdb iterator failed: {e}")))?;
-            if !String::from_utf8_lossy(&key).starts_with(prefix) {
-                break;
-            }
-            let json: Value = serde_json::from_slice(&val)
-                .map_err(|e| StoreError::new(format!("transaction decode failed: {e}")))?;
-            let tx = transaction_from_value(&json)?;
-            if tx.key_fields.get(&field).map(String::as_str) == Some(value.as_str()) {
-                out.push(tx);
+        let prefix = index_key_field_prefix(&field, &value);
+        for tx_id in tx_ids_for_prefix(&db, &prefix)? {
+            if let Some(tx) = load_tx_by_id(&db, &tx_id)? {
+                if tx.key_fields.get(&field).map(String::as_str) == Some(value.as_str()) {
+                    out.push(tx);
+                }
             }
         }
         Ok(out)
     })
     .await
+}
+
+fn tx_key(tx_id: &str) -> String {
+    format!("{TX_PREFIX}{tx_id}")
+}
+
+fn index_state_prefix(state: &str) -> String {
+    format!("{IDX_STATE_PREFIX}{state}{INDEX_SEP}")
+}
+
+fn index_pipeline_prefix(pipeline: &str) -> String {
+    format!("{IDX_PIPELINE_PREFIX}{pipeline}{INDEX_SEP}")
+}
+
+fn index_message_type_prefix(message_type: &str) -> String {
+    format!("{IDX_MESSAGE_TYPE_PREFIX}{message_type}{INDEX_SEP}")
+}
+
+fn index_key_field_prefix(field: &str, value: &str) -> String {
+    format!("{IDX_KEY_PREFIX}{field}:{value}{INDEX_SEP}")
+}
+
+fn index_state_key(state: &str, tx_id: &str) -> String {
+    format!("{IDX_STATE_PREFIX}{state}{INDEX_SEP}{tx_id}")
+}
+
+fn index_pipeline_key(pipeline: &str, tx_id: &str) -> String {
+    format!("{IDX_PIPELINE_PREFIX}{pipeline}{INDEX_SEP}{tx_id}")
+}
+
+fn index_message_type_key(message_type: &str, tx_id: &str) -> String {
+    format!("{IDX_MESSAGE_TYPE_PREFIX}{message_type}{INDEX_SEP}{tx_id}")
+}
+
+fn index_key_field_key(field: &str, value: &str, tx_id: &str) -> String {
+    format!("{IDX_KEY_PREFIX}{field}:{value}{INDEX_SEP}{tx_id}")
+}
+
+fn insert_transaction_indexes(batch: &mut WriteBatch, tx: &TransactionRecord) {
+    batch.put(index_state_key(&tx.state, &tx.tx_id).as_bytes(), b"1");
+    batch.put(index_pipeline_key(&tx.pipeline, &tx.tx_id).as_bytes(), b"1");
+    batch.put(
+        index_message_type_key(&tx.message_type, &tx.tx_id).as_bytes(),
+        b"1",
+    );
+    for (field, value) in &tx.key_fields {
+        batch.put(
+            index_key_field_key(field, value, &tx.tx_id).as_bytes(),
+            b"1",
+        );
+    }
+}
+
+fn remove_transaction_indexes(batch: &mut WriteBatch, tx: &TransactionRecord) {
+    batch.delete(index_state_key(&tx.state, &tx.tx_id).as_bytes());
+    batch.delete(index_pipeline_key(&tx.pipeline, &tx.tx_id).as_bytes());
+    batch.delete(index_message_type_key(&tx.message_type, &tx.tx_id).as_bytes());
+    for (field, value) in &tx.key_fields {
+        batch.delete(index_key_field_key(field, value, &tx.tx_id).as_bytes());
+    }
+}
+
+fn tx_ids_for_prefix(db: &DB, prefix: &str) -> Result<Vec<String>, StoreError> {
+    let mut tx_ids = Vec::new();
+    for item in db.iterator(IteratorMode::From(prefix.as_bytes(), Direction::Forward)) {
+        let (key, _) =
+            item.map_err(|e| StoreError::new(format!("rocksdb iterator failed: {e}")))?;
+        let key_str = String::from_utf8_lossy(&key);
+        if !key_str.starts_with(prefix) {
+            break;
+        }
+        let Some(tx_id) = key_str.strip_prefix(prefix) else {
+            continue;
+        };
+        tx_ids.push(tx_id.to_string());
+    }
+    Ok(tx_ids)
+}
+
+fn record_matches_filter(record: &TransactionRecord, filter: &StoreQuery) -> bool {
+    if let Some(ref pipeline) = filter.pipeline {
+        if &record.pipeline != pipeline {
+            return false;
+        }
+    }
+    if let Some(ref message_type) = filter.message_type {
+        if &record.message_type != message_type {
+            return false;
+        }
+    }
+    if let Some(ref state) = filter.state {
+        if &record.state != state {
+            return false;
+        }
+    }
+    if let Some(since) = filter.since {
+        if record.received_at < since {
+            return false;
+        }
+    }
+    if let Some(until) = filter.until {
+        if record.received_at > until {
+            return false;
+        }
+    }
+    true
 }
 
 async fn run_blocking<T>(
@@ -462,7 +598,7 @@ fn put_value(db: &DB, key: &str, value: &Value) -> Result<(), StoreError> {
 }
 
 fn load_tx_by_id(db: &DB, tx_id: &str) -> Result<Option<TransactionRecord>, StoreError> {
-    let key = format!("tx:{tx_id}");
+    let key = tx_key(tx_id);
     let raw = db
         .get(key)
         .map_err(|e| StoreError::new(format!("rocksdb get failed: {e}")))?;
@@ -570,4 +706,155 @@ fn decode_time(value: i64) -> SystemTime {
         return UNIX_EPOCH;
     }
     UNIX_EPOCH + Duration::from_millis(value as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::time::SystemTime;
+
+    use mx20022_store::{Outcome, Store, StoreQuery, TransactionRecord, TransactionUpdate};
+    use tempfile::TempDir;
+
+    use super::RocksDbStore;
+
+    fn sample_record(tx_id: &str, state: &str, pipeline: &str) -> TransactionRecord {
+        TransactionRecord {
+            tx_id: tx_id.to_string(),
+            pipeline: pipeline.to_string(),
+            source_channel: "http-in".to_string(),
+            message_type: "pacs.008".to_string(),
+            raw_message: "<Document/>".to_string(),
+            state: state.to_string(),
+            received_at: SystemTime::now(),
+            completed_at: None,
+            key_fields: HashMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn begin_and_find_round_trip() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = RocksDbStore::open(dir.path().to_string_lossy().to_string()).expect("store");
+        let tx = sample_record("tx-1", "RECEIVED", "p1");
+        store.begin_transaction(&tx).await.expect("begin");
+
+        let loaded = store
+            .find_by_id("tx-1")
+            .await
+            .expect("find")
+            .expect("record");
+        assert_eq!(loaded.tx_id, "tx-1");
+        assert_eq!(loaded.state, "RECEIVED");
+    }
+
+    #[tokio::test]
+    async fn find_by_key_field_uses_indexed_keys() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = RocksDbStore::open(dir.path().to_string_lossy().to_string()).expect("store");
+
+        let mut first = sample_record("tx-1", "COMMITTED", "p1");
+        first
+            .key_fields
+            .insert("message_id".to_string(), "MSG-1".to_string());
+        store.begin_transaction(&first).await.expect("begin first");
+
+        let mut second = sample_record("tx-2", "COMMITTED", "p1");
+        second
+            .key_fields
+            .insert("message_id".to_string(), "MSG-2".to_string());
+        store
+            .begin_transaction(&second)
+            .await
+            .expect("begin second");
+
+        let matches = store.find_by_message_id("MSG-1").await.expect("query");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].tx_id, "tx-1");
+    }
+
+    #[tokio::test]
+    async fn query_filters_by_state_and_pipeline() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = RocksDbStore::open(dir.path().to_string_lossy().to_string()).expect("store");
+
+        store
+            .begin_transaction(&sample_record("tx-1", "COMMITTED", "p1"))
+            .await
+            .expect("begin");
+        store
+            .begin_transaction(&sample_record("tx-2", "ABORTED", "p1"))
+            .await
+            .expect("begin");
+        store
+            .begin_transaction(&sample_record("tx-3", "COMMITTED", "p2"))
+            .await
+            .expect("begin");
+
+        let result = store
+            .query(StoreQuery {
+                pipeline: Some("p1".to_string()),
+                message_type: None,
+                state: Some("COMMITTED".to_string()),
+                since: None,
+                until: None,
+                limit: None,
+            })
+            .await
+            .expect("query");
+        assert_eq!(result.total, 1);
+        assert_eq!(result.records[0].tx_id, "tx-1");
+    }
+
+    #[tokio::test]
+    async fn state_index_reflects_updates() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = RocksDbStore::open(dir.path().to_string_lossy().to_string()).expect("store");
+
+        store
+            .begin_transaction(&sample_record("tx-1", "RECEIVED", "p1"))
+            .await
+            .expect("begin");
+        store
+            .update_transaction(
+                "tx-1",
+                TransactionUpdate {
+                    state: Some("COMMITTING".to_string()),
+                    error: None,
+                },
+            )
+            .await
+            .expect("update");
+        store
+            .complete_transaction("tx-1", Outcome::Committed)
+            .await
+            .expect("complete");
+
+        let received = store
+            .query(StoreQuery {
+                pipeline: None,
+                message_type: None,
+                state: Some("RECEIVED".to_string()),
+                since: None,
+                until: None,
+                limit: None,
+            })
+            .await
+            .expect("query");
+        assert_eq!(received.total, 0);
+
+        let committed = store
+            .query(StoreQuery {
+                pipeline: None,
+                message_type: None,
+                state: Some("COMMITTED".to_string()),
+                since: None,
+                until: None,
+                limit: None,
+            })
+            .await
+            .expect("query");
+        assert_eq!(committed.total, 1);
+        assert_eq!(committed.records[0].tx_id, "tx-1");
+    }
 }

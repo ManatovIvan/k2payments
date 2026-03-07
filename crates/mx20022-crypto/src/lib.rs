@@ -4,11 +4,13 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use hkdf::Hkdf;
 use rand::RngCore;
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 
 pub struct CryptoService {
     key_bytes: [u8; 32],
 }
+
+const HKDF_SALT: &[u8] = b"mx20022-runtime-hkdf-sha256-v1";
 
 impl std::fmt::Debug for CryptoService {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -26,9 +28,8 @@ impl CryptoService {
             ));
         }
 
-        // Derive a fixed-length key for AES-256 using HKDF-SHA256.
-        let kdf_salt = Sha256::digest(master_key.as_bytes());
-        let hk = Hkdf::<Sha256>::new(Some(kdf_salt.as_slice()), master_key.as_bytes());
+        // Derive a fixed-length key for AES-256 using HKDF-SHA256 with a domain-separated salt.
+        let hk = Hkdf::<Sha256>::new(Some(HKDF_SALT), master_key.as_bytes());
         let mut key_bytes = [0_u8; 32];
         hk.expand(b"aes-256-gcm-key", &mut key_bytes)
             .map_err(|e| CryptoError::InvalidMasterKey(format!("HKDF expand failed: {e}")))?;

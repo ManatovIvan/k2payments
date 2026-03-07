@@ -1,0 +1,124 @@
+{
+  "metadata": {
+    "task_short": "test-coverage-audit",
+    "agent_abbr": "ta",
+    "datetime_utc": "2026-03-06T21:30:00Z",
+    "filename": "2026-03-06T21-30-00Z__test-coverage-audit__ta.json",
+    "supersedes": "2026-03-06T00-00-00Z__test-coverage-audit__ta.json",
+    "version": "1.0"
+  },
+  "state": {
+    "objectives": [
+      "Full test coverage audit of the mx20022 payments runtime workspace at /Volumes/Everything/Development/k2payments"
+    ],
+    "constraints": [
+      "Read-only: no code changes",
+      "Assess all #[cfg(test)] sections, integration tests/, CI config, and dead test files"
+    ],
+    "important_facts": [
+      "46 total test functions across 24 files (cargo grep count)",
+      "6 unit tests in app.rs (inline #[cfg(test)]): builds_runtime_from_valid_config, processes_message_through_pipeline, duplicate_checker_aborts_pipeline_when_message_id_exists, recovers_incomplete_transactions_from_store, reloads_participant_configs_when_topology_is_unchanged, rejects_reload_when_participant_topology_changes",
+      "1 e2e integration test in crates/mx20022-runtime/tests/e2e_pipeline.rs: e2e_process_pacs008_commits_and_persists_context — tests full pipeline: config->app->process->store verify",
+      "21 config unit tests in crates/mx20022-config/src/lib.rs covering admin_auth modes, pipeline validation, channel field round-trips",
+      "3 sqlite store tests in lib.rs: begin_find_update_complete_transaction, expectation_and_dead_letter_round_trip, query_applies_sql_filters_and_limit",
+      "5 additional sqlite tests in tests_missing.rs — NOT wired into build (still gated by comment in lib.rs saying mod tests_missing is present but tests_missing.rs has a warning it is NOT wired)",
+      "NOTE: tests_missing.rs IS included via `mod tests_missing;` at lib.rs:13 — it IS compiled but tests_missing.rs wraps everything inside a nested `#[cfg(test)] mod tests {}` so they do run",
+      "mx20022-store-postgres has a #[cfg(test)] block but zero actual test functions — just the marker",
+      "mx20022-store-rocksdb: not yet read but implied to be similar",
+      "engine.rs (run_pipelines, channel dispatch, infer_message_type, extract_* helpers) has ZERO tests",
+      "domain.rs (TransactionRequest::validate) has ZERO tests",
+      "application.rs (TransactionUseCase) has ZERO tests",
+      "CryptoService: only 1 test (encrypt_decrypt_roundtrip)",
+      "CorrelationEngine: 1 test covering register+match+timeout combined",
+      "CircuitBreaker: 1 test (opens_after_threshold_and_blocks_prepare) — missing: auto-recovery after open_duration, commit resets counter",
+      "RateLimiter: 1 test — not visible in this read, likely just global scope check",
+      "RoutingEngine: 2 tests",
+      "DuplicateChecker: 2 tests (aborts on dup message_id, prepares when no dup)",
+      "AdminGrpcService tests: grpc.rs has 1 test block",
+      "AdminHTTP dispatch: 1 test block in http.rs",
+      "Auth module (auth.rs): has #[cfg(test)] block",
+      "CI workflow: runs cargo fmt --all --check, cargo clippy --workspace -D warnings, cargo deny check, cargo test --workspace — clippy and deny now present (improvement since last audit)",
+      "No coverage reporting step in CI",
+      "No proptest/quickcheck/criterion anywhere in workspace",
+      "tests/harness/ and tests/fixtures/ still empty stubs"
+    ],
+    "decisions_made": [
+      "Confirmed tests_missing.rs for sqlite IS compiled (mod tests_missing at lib.rs:13) — 5 additional tests do run",
+      "Categorized findings as CRITICAL / RECOMMEND / SUGGEST"
+    ],
+    "artifacts": [
+      "/Volumes/Everything/Development/k2payments/crates/mx20022-runtime/tests/e2e_pipeline.rs",
+      "/Volumes/Everything/Development/k2payments/crates/mx20022-runtime/src/app.rs (tests at line 682)",
+      "/Volumes/Everything/Development/k2payments/crates/mx20022-config/src/lib.rs (tests at line 283)",
+      "/Volumes/Everything/Development/k2payments/crates/mx20022-store/mx20022-store-sqlite/src/lib.rs (tests at line 605)",
+      "/Volumes/Everything/Development/k2payments/crates/mx20022-store/mx20022-store-sqlite/src/tests_missing.rs",
+      "/Volumes/Everything/Development/k2payments/.github/workflows/ci.yml"
+    ],
+    "dependencies": [],
+    "risks_issues": [
+      "engine.rs run_pipelines and all extract_* helpers have zero test coverage — this is the channel dispatch backbone",
+      "domain.rs TransactionRequest::validate has zero test coverage — 5 field validations untested",
+      "CryptoService has only 1 test — wrong-key decryption, empty key, unsupported algorithm all untested",
+      "PostgresStore has zero test functions — production backend completely unvalidated",
+      "No coverage gate in CI — merges proceed regardless of coverage regression",
+      "DuplicateChecker: no test for when multiple keys match, or when XML has no relevant fields at all",
+      "CircuitBreaker: no test for auto-recovery after open_duration expires",
+      "AcknowledgementBuilder: no test for overwrite_existing=true path",
+      "StatusResponseBuilder: abort() path tested nowhere — only commit() is covered",
+      "infer_message_type() in engine.rs: no test for JSON content-type branch vs XML fallback"
+    ]
+  },
+  "iteration": {
+    "summary": "Second full pass of the workspace. Since the previous audit, significant test additions have been made: the inline tests in app.rs grew from 0 to 6 well-scoped unit tests covering build, process, duplicate-guard, recovery, and hot-reload; 21 config validation tests were added to mx20022-config; a true E2E integration test was added to crates/mx20022-runtime/tests/; and CI was upgraded to include clippy and cargo-deny gates. The SQLite store now has 8 tests total (3 in lib.rs + 5 in tests_missing.rs which is now compiled). Key remaining gaps are: engine.rs has zero tests despite containing all channel dispatch logic; domain.rs TransactionRequest::validate has no unit coverage; CryptoService has only a happy-path roundtrip; PostgresStore is completely untested; and no coverage reporting exists in CI.",
+    "inputs_consulted": [
+      "/Volumes/Everything/Development/k2payments/crates/mx20022-runtime/tests/e2e_pipeline.rs",
+      "/Volumes/Everything/Development/k2payments/crates/mx20022-runtime/src/app.rs",
+      "/Volumes/Everything/Development/k2payments/crates/mx20022-runtime/src/engine.rs",
+      "/Volumes/Everything/Development/k2payments/crates/mx20022-runtime/src/domain.rs",
+      "/Volumes/Everything/Development/k2payments/crates/mx20022-runtime/src/application.rs",
+      "/Volumes/Everything/Development/k2payments/crates/mx20022-config/src/lib.rs",
+      "/Volumes/Everything/Development/k2payments/crates/mx20022-crypto/src/lib.rs",
+      "/Volumes/Everything/Development/k2payments/crates/mx20022-store/src/lib.rs",
+      "/Volumes/Everything/Development/k2payments/crates/mx20022-store/mx20022-store-sqlite/src/lib.rs",
+      "/Volumes/Everything/Development/k2payments/crates/mx20022-store/mx20022-store-sqlite/src/tests_missing.rs",
+      "/Volumes/Everything/Development/k2payments/crates/mx20022-store/mx20022-store-postgres/src/lib.rs",
+      "/Volumes/Everything/Development/k2payments/crates/mx20022-participants/src/acknowledgement_builder.rs",
+      "/Volumes/Everything/Development/k2payments/crates/mx20022-participants/src/status_response_builder.rs",
+      "/Volumes/Everything/Development/k2payments/crates/mx20022-participants/src/duplicate_checker.rs",
+      "/Volumes/Everything/Development/k2payments/crates/mx20022-participants/src/circuit_breaker.rs",
+      "/Volumes/Everything/Development/k2payments/crates/mx20022-participants/src/rate_limiter.rs",
+      "/Volumes/Everything/Development/k2payments/crates/mx20022-participants/src/routing_engine.rs",
+      "/Volumes/Everything/Development/k2payments/crates/mx20022-correlation/src/lib.rs",
+      "/Volumes/Everything/Development/k2payments/crates/mx20022-admin/src/grpc.rs",
+      "/Volumes/Everything/Development/k2payments/crates/mx20022-admin/src/http.rs",
+      "/Volumes/Everything/Development/k2payments/crates/mx20022-admin/src/auth.rs",
+      "/Volumes/Everything/Development/k2payments/.github/workflows/ci.yml"
+    ],
+    "outputs_produced": [
+      "Structured test coverage report delivered to user",
+      "This context file"
+    ],
+    "next_actions": [
+      "Add unit tests for domain.rs TransactionRequest::validate (all 5 empty-field paths)",
+      "Add unit tests for engine.rs infer_message_type and extract_* helpers",
+      "Add CryptoService tests: empty master key, wrong-key decryption, unsupported algorithm, tampered ciphertext",
+      "Add PostgresStore integration tests using testcontainers-rs",
+      "Add CI coverage step: cargo llvm-cov --workspace with minimum threshold",
+      "Wire up a proper mock Store for unit tests that don't need SQLite"
+    ]
+  },
+  "cross_agent_notes": {
+    "mentions": [
+      {
+        "agent_abbr": "sec",
+        "filename": "2026-03-06T20-00-00Z__security-audit__sec.json",
+        "relevance_note": "Security audit flagged CryptoService and auth module as high priority — test gaps in crypto confirm this"
+      },
+      {
+        "agent_abbr": "cr",
+        "filename": "2026-03-06T00-00-00Z__code-quality-review__cr.json",
+        "relevance_note": "Code quality review noted engine.rs complexity — zero test coverage on that file is consistent"
+      }
+    ]
+  }
+}

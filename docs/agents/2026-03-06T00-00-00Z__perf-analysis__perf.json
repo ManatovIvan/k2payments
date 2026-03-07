@@ -2,53 +2,48 @@
   "metadata": {
     "task_short": "perf-analysis",
     "agent_abbr": "perf",
-    "datetime_utc": "2026-03-06T00:00:00Z",
+    "datetime_utc": "2026-03-06T12:00:00Z",
     "filename": "2026-03-06T00-00-00Z__perf-analysis__perf.json",
     "supersedes": null,
-    "version": "1.0"
+    "version": "2.0"
   },
   "state": {
     "objectives": [
-      "Analyze performance characteristics of mx20022-runtime workspace",
-      "Identify critical bottlenecks in store, engine, context, channels",
-      "Classify findings as critical, recommended, or acceptable-for-alpha"
+      "Deep performance analysis of MX20022 runtime with file:line references"
     ],
-    "constraints": ["Alpha stage - prioritize correctness over perf where needed"],
+    "constraints": ["Read-only analysis"],
     "important_facts": [
-      "SQLite store uses sqlx pool with connect_lazy, no pool_size config wired through",
-      "PRAGMA WAL set per-connection via OnceCell init - only runs once but PRAGMA is per-connection",
-      "query() method loads ALL rows then filters in Rust",
-      "update_transaction does read-modify-write without SQL transaction wrapping",
-      "Context uses Box<dyn Any> with Vec<ValueMutation> per key plus unbounded audit_log",
-      "Engine semaphore pattern is correct for concurrency limiting",
-      "HTTP channels now use axum (not raw TCP) - no manual buffer sizing",
-      "set_active_transactions uses absolute set(1)/set(0), not inc/dec - race condition",
-      "Audit log entries are persisted one-at-a-time in a loop (N+2 queries per tx)"
+      "6 CRITICAL, 7 RECOMMEND, 5 SUGGEST findings",
+      "std::sync::Mutex in async participants (rate_limiter, circuit_breaker)",
+      "std::sync::RwLock in main.rs reload_status (accessed from async)",
+      "Postgres pool_size config exists but never applied",
+      "JSONB queries lack GIN indexes",
+      "RocksDB full table scan on every query/find",
+      "DuplicateChecker N+1 sequential DB queries",
+      "raw_message cloned 3+ times per transaction",
+      "TCP outbound opens new connection per send",
+      "std::fs::read_to_string in async reload handler",
+      "list_dead_letters does app-side filtering",
+      "escape_xml chains 5 .replace() allocations"
     ],
     "decisions_made": [],
     "artifacts": [],
     "dependencies": [],
-    "risks_issues": [
-      "query() full-table scan: will degrade as transaction volume grows",
-      "update_transaction TOCTOU: concurrent updates can lose writes",
-      "set_active_transactions gauge is wrong under concurrency",
-      "PRAGMA WAL only applied on first pool connection"
-    ]
+    "risks_issues": []
   },
   "iteration": {
-    "summary": "Completed full read of 8 source files covering store, engine, app, transaction_manager, context, HTTP channels, admin host, and config. Identified critical bottlenecks in query(), update_transaction race condition, metrics gauge misuse, and PRAGMA initialization. HTTP channels have been migrated to axum so buffer concerns are resolved.",
+    "summary": "Comprehensive performance audit with concrete file:line references across engine, store backends, channels, and participants. 18 findings categorized as CRITICAL/RECOMMEND/SUGGEST. Top concerns: std::sync locks in async code, ignored pool config, missing DB indexes, full-scan queries, excessive payload cloning, and blocking I/O in async context.",
     "inputs_consulted": [
-      "crates/mx20022-store/mx20022-store-sqlite/src/lib.rs",
       "crates/mx20022-runtime/src/engine.rs",
       "crates/mx20022-runtime/src/app.rs",
-      "crates/mx20022-runtime-core/src/transaction_manager.rs",
-      "crates/mx20022-runtime-core/src/context.rs",
-      "crates/mx20022-channels/mx20022-channel-http/src/lib.rs",
-      "crates/mx20022-admin/src/host.rs",
+      "crates/mx20022-runtime/src/main.rs",
+      "crates/mx20022-channels/*/src/lib.rs",
+      "crates/mx20022-store/*/src/lib.rs",
+      "crates/mx20022-participants/src/*.rs",
       "crates/mx20022-config/src/lib.rs"
     ],
-    "outputs_produced": ["Performance analysis report"],
-    "next_actions": ["Implement fixes for critical items if requested"]
+    "outputs_produced": ["Performance analysis report with 18 findings"],
+    "next_actions": ["Implement fixes if requested, starting with CRITICAL items"]
   },
   "cross_agent_notes": {
     "mentions": []

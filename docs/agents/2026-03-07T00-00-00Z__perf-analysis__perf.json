@@ -1,0 +1,76 @@
+{
+  "metadata": {
+    "task_short": "perf-analysis",
+    "agent_abbr": "perf",
+    "datetime_utc": "2026-03-07T00:00:00Z",
+    "filename": "2026-03-07T00-00-00Z__perf-analysis__perf.json",
+    "supersedes": "2026-03-06T00-00-00Z__perf-analysis__perf.json",
+    "version": "1.0"
+  },
+  "state": {
+    "objectives": [
+      "Deep performance analysis of MX20022 runtime with file:line references across 11 focus areas"
+    ],
+    "constraints": ["Read-only analysis, no code changes"],
+    "important_facts": [
+      "No benchmarks exist (benches/ directory empty)",
+      "No [profile.release] section in any Cargo.toml -- no LTO, no codegen-units tuning",
+      "RocksDB store does full table scan for every query() and find_by_key_field()",
+      "DuplicateChecker performs up to 3 sequential DB queries per message (N+1 pattern)",
+      "raw_message (full XML payload) cloned 3+ times per transaction on hot path",
+      "TCP outbound opens new connection per send -- no connection pooling",
+      "escape_xml chains 5 .replace() allocations on every call",
+      "Context stores raw_message as owned String cloned into ContextMeta",
+      "update_transaction does read-modify-write (2 round trips) in both Postgres and SQLite",
+      "Store trait default count_dead_letters loads all rows then counts",
+      "Store trait default count_pending_expectations loads all rows then counts",
+      "Store trait default count_transactions_by_states loops N states with full query per state",
+      "Metrics use with_label_values on every call -- no caching of label lookups",
+      "Correlation engine holds write lock during timeout_scan iteration",
+      "No backpressure signal from pipeline to channel beyond mpsc buffer of 1024"
+    ],
+    "decisions_made": [],
+    "artifacts": [],
+    "dependencies": [],
+    "risks_issues": [
+      "RocksDB full scan: will degrade linearly with data growth",
+      "No release profile: production binary not optimized",
+      "No benchmarks: no regression detection for hot paths"
+    ]
+  },
+  "iteration": {
+    "summary": "Comprehensive performance audit covering all 11 focus areas with concrete file:line references. Found 7 Critical Bottleneck, 8 Significant Issue, and 6 Minor Optimization findings plus 3 Good Practice acknowledgments. Top concerns: RocksDB full table scans, excessive raw_message cloning on hot path, N+1 DB queries in DuplicateChecker, no release profile optimization, no benchmarks, TCP connection-per-send, and read-modify-write pattern in update_transaction.",
+    "inputs_consulted": [
+      "All Cargo.toml files",
+      "crates/mx20022-runtime/src/engine.rs",
+      "crates/mx20022-runtime/src/app.rs",
+      "crates/mx20022-runtime/src/main.rs",
+      "crates/mx20022-runtime/src/application.rs",
+      "crates/mx20022-runtime/src/domain.rs",
+      "crates/mx20022-store/src/lib.rs",
+      "crates/mx20022-store/mx20022-store-postgres/src/lib.rs",
+      "crates/mx20022-store/mx20022-store-sqlite/src/lib.rs",
+      "crates/mx20022-store/mx20022-store-rocksdb/src/lib.rs",
+      "crates/mx20022-participants/src/lib.rs",
+      "crates/mx20022-participants/src/rate_limiter.rs",
+      "crates/mx20022-participants/src/circuit_breaker.rs",
+      "crates/mx20022-participants/src/duplicate_checker.rs",
+      "crates/mx20022-participants/src/schema_validator.rs",
+      "crates/mx20022-participants/src/acknowledgement_builder.rs",
+      "crates/mx20022-participants/src/error_response_builder.rs",
+      "crates/mx20022-participants/src/status_response_builder.rs",
+      "crates/mx20022-runtime-core/src/context.rs",
+      "crates/mx20022-runtime-core/src/transaction_manager.rs",
+      "crates/mx20022-runtime-core/src/participant.rs",
+      "crates/mx20022-channels/src/lib.rs",
+      "crates/mx20022-channels/mx20022-channel-tcp/src/lib.rs",
+      "crates/mx20022-metrics/src/lib.rs",
+      "crates/mx20022-correlation/src/lib.rs"
+    ],
+    "outputs_produced": ["Performance analysis report with 21 findings"],
+    "next_actions": ["Implement fixes if requested, starting with Critical items"]
+  },
+  "cross_agent_notes": {
+    "mentions": []
+  }
+}

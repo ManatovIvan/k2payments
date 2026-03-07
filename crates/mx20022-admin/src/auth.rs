@@ -2,6 +2,7 @@ use std::collections::HashSet;
 
 use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 use serde::Deserialize;
+use subtle::ConstantTimeEq;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdminResource {
@@ -147,7 +148,7 @@ fn authorize_legacy(
         .map(ToString::to_string);
 
     if let Some(expected_admin) = admin_token.as_deref() {
-        if token == expected_admin {
+        if constant_time_eq(token, expected_admin) {
             return Ok(());
         }
     } else {
@@ -157,7 +158,7 @@ fn authorize_legacy(
     if matches!(resource, AdminResource::Ready | AdminResource::Status)
         && readonly_token
             .as_deref()
-            .is_some_and(|expected| token == expected)
+            .is_some_and(|expected| constant_time_eq(token, expected))
     {
         return Ok(());
     }
@@ -265,12 +266,29 @@ pub fn parse_bearer_token(header: Option<&str>) -> Option<&str> {
     Some(token)
 }
 
+fn constant_time_eq(left: &str, right: &str) -> bool {
+    let left = left.as_bytes();
+    let right = right.as_bytes();
+    let max_len = left.len().max(right.len());
+
+    let mut left_padded = vec![0_u8; max_len];
+    let mut right_padded = vec![0_u8; max_len];
+    left_padded[..left.len()].copy_from_slice(left);
+    right_padded[..right.len()].copy_from_slice(right);
+
+    let content_eq = left_padded.ct_eq(&right_padded);
+    let len_eq = (left.len() as u64).ct_eq(&(right.len() as u64));
+    bool::from(content_eq & len_eq)
+}
+
 #[cfg(test)]
 mod tests {
     use jsonwebtoken::{encode, EncodingKey, Header};
     use serde::Serialize;
 
-    use super::{authorize_request, AdminResource, AuthConfig, AuthError, AuthMode};
+    use super::{
+        authorize_request, constant_time_eq, AdminResource, AuthConfig, AuthError, AuthMode,
+    };
 
     #[derive(Debug, Serialize)]
     struct Claims {
@@ -399,5 +417,10 @@ mod tests {
             None,
         );
         assert!(admin_reload.is_ok());
+    }
+
+    #[test]
+    fn constant_time_eq_rejects_mismatched_lengths() {
+        assert!(!constant_time_eq("one", "three"));
     }
 }

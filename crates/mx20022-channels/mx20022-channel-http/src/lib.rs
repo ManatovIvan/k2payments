@@ -4,8 +4,8 @@ use async_trait::async_trait;
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::header::{
-    CONTENT_SECURITY_POLICY, REFERRER_POLICY, STRICT_TRANSPORT_SECURITY, X_CONTENT_TYPE_OPTIONS,
-    X_FRAME_OPTIONS,
+    AUTHORIZATION, CONTENT_SECURITY_POLICY, CONTENT_TYPE, REFERRER_POLICY,
+    STRICT_TRANSPORT_SECURITY, X_CONTENT_TYPE_OPTIONS, X_FRAME_OPTIONS,
 };
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::middleware::map_response;
@@ -17,7 +17,7 @@ use mx20022_channels::{
     OutboundMessage,
 };
 use tokio::sync::{mpsc, RwLock};
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::CorsLayer;
 
 #[derive(Debug, Clone)]
 pub struct HttpInboundConfig {
@@ -25,6 +25,7 @@ pub struct HttpInboundConfig {
     pub bind: String,
     pub content_type: String,
     pub auth: InboundAuthConfig,
+    pub cors_allowed_origins: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -65,12 +66,7 @@ impl InboundChannel for HttpInboundChannel {
 
         let app = Router::new()
             .route("/", post(handle_post))
-            .layer(
-                CorsLayer::new()
-                    .allow_origin(Any)
-                    .allow_methods([Method::POST])
-                    .allow_headers(Any),
-            )
+            .layer(build_cors_layer(&self.config.cors_allowed_origins))
             .layer(map_response(add_security_headers))
             .layer(axum::extract::DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
             .with_state(state);
@@ -158,6 +154,25 @@ async fn handle_post(
 }
 
 const MAX_HTTP_BODY_BYTES: usize = 10 * 1024 * 1024;
+
+fn build_cors_layer(allowed_origins: &[String]) -> CorsLayer {
+    let mut layer = CorsLayer::new()
+        .allow_methods([Method::POST])
+        .allow_headers([
+            AUTHORIZATION,
+            CONTENT_TYPE,
+            HeaderName::from_static("x-client-cert-subject"),
+        ]);
+
+    let parsed_origins = allowed_origins
+        .iter()
+        .filter_map(|origin| HeaderValue::from_str(origin).ok())
+        .collect::<Vec<_>>();
+    if !parsed_origins.is_empty() {
+        layer = layer.allow_origin(parsed_origins);
+    }
+    layer
+}
 
 async fn add_security_headers(mut response: axum::response::Response) -> axum::response::Response {
     let headers = response.headers_mut();

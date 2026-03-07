@@ -4,13 +4,14 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use mx20022_channels::auth::constant_time_eq;
 use mx20022_channels::{
     ChannelError, ChannelHealth, DeliveryReceipt, InboundChannel, InboundMessage, OutboundChannel,
     OutboundMessage,
 };
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 
 #[derive(Debug, Clone, Copy)]
 pub enum TcpFraming {
@@ -121,6 +122,7 @@ pub struct TcpOutboundConfig {
 pub struct TcpOutboundChannel {
     config: TcpOutboundConfig,
     shutdown: Arc<AtomicBool>,
+    connection: Arc<Mutex<Option<TcpStream>>>,
 }
 
 impl TcpOutboundChannel {
@@ -128,7 +130,14 @@ impl TcpOutboundChannel {
         Self {
             config,
             shutdown: Arc::new(AtomicBool::new(false)),
+            connection: Arc::new(Mutex::new(None)),
         }
+    }
+
+    async fn connect(&self) -> Result<TcpStream, ChannelError> {
+        TcpStream::connect(&self.config.endpoint)
+            .await
+            .map_err(|e| ChannelError::new(format!("tcp connect failed: {e}")))
     }
 }
 
@@ -143,13 +152,26 @@ impl OutboundChannel for TcpOutboundChannel {
             return Err(ChannelError::new("channel is shut down"));
         }
 
-        let mut stream = TcpStream::connect(&self.config.endpoint)
-            .await
-            .map_err(|e| ChannelError::new(format!("tcp connect failed: {e}")))?;
+        let mut guard = self.connection.lock().await;
+        if guard.is_none() {
+            *guard = Some(self.connect().await?);
+        }
 
-        write_frame(&mut stream, self.config.framing, msg.raw.as_bytes())
-            .await
-            .map_err(|e| ChannelError::new(format!("tcp send failed: {e}")))?;
+        let mut send_error = None;
+        if let Some(stream) = guard.as_mut() {
+            if let Err(error) = write_frame(stream, self.config.framing, msg.raw.as_bytes()).await {
+                send_error = Some(error);
+            }
+        }
+
+        if send_error.is_some() {
+            *guard = Some(self.connect().await?);
+            if let Some(stream) = guard.as_mut() {
+                write_frame(stream, self.config.framing, msg.raw.as_bytes())
+                    .await
+                    .map_err(|e| ChannelError::new(format!("tcp send failed: {e}")))?;
+            }
+        }
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -162,6 +184,7 @@ impl OutboundChannel for TcpOutboundChannel {
 
     async fn shutdown(&self) -> Result<(), ChannelError> {
         self.shutdown.store(true, Ordering::Relaxed);
+        *self.connection.lock().await = None;
         Ok(())
     }
 
@@ -186,7 +209,7 @@ async fn process_connection(
             if let Some(expected) = auth_token.as_deref() {
                 let auth_frame = read_length_prefixed(&mut stream).await?;
                 let presented = decode_utf8_payload(&auth_frame)?;
-                if presented.trim() != expected {
+                if !constant_time_eq(presented.trim(), expected) {
                     return Err(ChannelError::new("tcp auth failed"));
                 }
             }
@@ -217,7 +240,7 @@ async fn process_connection(
                     let _ = auth_buf.pop();
                 }
                 let presented = decode_utf8_payload(&auth_buf)?;
-                if presented.trim() != expected {
+                if !constant_time_eq(presented.trim(), expected) {
                     return Err(ChannelError::new("tcp auth failed"));
                 }
             }

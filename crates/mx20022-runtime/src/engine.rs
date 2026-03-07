@@ -54,6 +54,10 @@ pub async fn run_pipelines(app: Arc<RuntimeApp>, config: RuntimeConfig) -> Resul
                     bind: extract_bind(channel_cfg)?,
                     content_type: "application/xml".to_string(),
                     auth: extract_inbound_auth(channel_cfg)?,
+                    cors_allowed_origins: extract_string_vec_or_single(
+                        channel_cfg,
+                        "cors_allowed_origins",
+                    ),
                 })),
                 #[cfg(feature = "channel-file")]
                 ("file", "watch") => Arc::new(FileInboundChannel::new(
@@ -259,6 +263,25 @@ fn extract_optional(channel_cfg: &ChannelSection, key: &str) -> Option<String> {
         .map(ToString::to_string)
 }
 
+#[cfg(feature = "channel-http")]
+fn extract_string_vec_or_single(channel_cfg: &ChannelSection, key: &str) -> Vec<String> {
+    let Some(value) = channel_cfg.extra.get(key) else {
+        return Vec::new();
+    };
+    if let Some(single) = value.as_str() {
+        return vec![single.to_string()];
+    }
+    value
+        .as_array()
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|item| item.as_str().map(ToString::to_string))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
 #[cfg(any(feature = "channel-tcp", feature = "channel-file"))]
 fn extract_u64(channel_cfg: &ChannelSection, key: &str) -> Option<u64> {
     channel_cfg
@@ -365,7 +388,14 @@ fn extract_inbound_auth(channel_cfg: &ChannelSection) -> Result<InboundAuthConfi
     };
 
     match auth.mode {
-        InboundAuthMode::Disabled => Ok(auth),
+        InboundAuthMode::Disabled => {
+            tracing::warn!(
+                channel_type = %channel_cfg.channel_type,
+                mode = %channel_cfg.mode,
+                "inbound channel auth is disabled"
+            );
+            Ok(auth)
+        }
         InboundAuthMode::StaticBearer => {
             if auth
                 .bearer_token

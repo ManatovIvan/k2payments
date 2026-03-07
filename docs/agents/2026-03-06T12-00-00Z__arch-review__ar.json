@@ -1,0 +1,63 @@
+{
+  "metadata": {
+    "task_short": "arch-review",
+    "agent_abbr": "ar",
+    "datetime_utc": "2026-03-06T12:00:00Z",
+    "filename": "2026-03-06T12-00-00Z__arch-review__ar.json",
+    "supersedes": "2026-03-06T00-00-00Z__arch-review__ar.json",
+    "version": "1.0"
+  },
+  "state": {
+    "objectives": [
+      "Full architectural review of mx20022 payments runtime workspace",
+      "Evaluate service boundaries, dependency graph, trait abstractions, SOLID compliance"
+    ],
+    "constraints": ["Rust workspace with 16 crates", "Feature-gated channel and store backends"],
+    "important_facts": [
+      "Clean DAG dependency graph with runtime-core at the leaf",
+      "Participant trait uses 2PC-inspired prepare/commit/abort protocol",
+      "build_participants in app.rs is a 200-line match factory - OCP violation",
+      "Engine owns channel construction - tightly coupled to all channel types",
+      "Duplicate Outcome enum in mx20022-store and mx20022-runtime-core",
+      "Admin has 3 parallel HTTP dispatch mechanisms (host.rs, http.rs, grpc.rs)",
+      "Session crate is structurally isolated - no consumer in the workspace",
+      "main.rs has 7-way if/else chain for service mode combinations"
+    ],
+    "decisions_made": [],
+    "artifacts": [
+      "crates/mx20022-runtime/src/app.rs",
+      "crates/mx20022-runtime/src/engine.rs",
+      "crates/mx20022-runtime/src/main.rs",
+      "crates/mx20022-runtime-core/src/participant.rs",
+      "crates/mx20022-runtime-core/src/transaction_manager.rs",
+      "crates/mx20022-channels/src/lib.rs",
+      "crates/mx20022-store/src/lib.rs",
+      "crates/mx20022-correlation/src/lib.rs",
+      "crates/mx20022-session/src/lib.rs",
+      "crates/mx20022-admin/src/controller.rs",
+      "crates/mx20022-config/src/lib.rs"
+    ],
+    "dependencies": [],
+    "risks_issues": [
+      "build_participants factory violates OCP: adding new participant requires modifying app.rs",
+      "TX_COUNTER global atomic is not unique across instances",
+      "in_flight_transaction_count issues N separate queries instead of one",
+      "admin status endpoint loads ALL dead letters and pending expectations to count them"
+    ]
+  },
+  "iteration": {
+    "summary": "Completed full architectural review of the mx20022 payments runtime workspace. Read all key source files across 16 crates. Identified clean DAG structure, well-designed trait abstractions for Store/Channel/Participant, proper feature gating. Found critical issues with participant factory violating OCP, duplicate Outcome enums, admin service coupling, and main.rs combinatorial explosion. Session crate appears orphaned.",
+    "inputs_consulted": [
+      "Cargo.toml (workspace)",
+      "All key source files in runtime, runtime-core, participants, config, channels, store, correlation, session, admin crates"
+    ],
+    "outputs_produced": ["Architectural review report"],
+    "next_actions": []
+  },
+  "cross_agent_notes": {
+    "mentions": [
+      {"agent_abbr": "cr", "filename": "2026-03-06T00-00-00Z__code-quality-review__cr.json", "relevance_note": "Code quality findings may overlap with architectural observations"},
+      {"agent_abbr": "sec", "filename": "2026-03-06T00-01-00Z__security-audit__sec.json", "relevance_note": "Auth architecture spans channels and admin crates"}
+    ]
+  }
+}

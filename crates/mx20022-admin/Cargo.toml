@@ -21,6 +21,7 @@ tokio-rustls = "0.26"
 tonic.workspace = true
 prost.workspace = true
 prost-types.workspace = true
+subtle.workspace = true
 
 [dev-dependencies]
 mx20022-store-sqlite = { path = "../mx20022-store/mx20022-store-sqlite" }

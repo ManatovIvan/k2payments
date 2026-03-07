@@ -7,6 +7,22 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: mx20022_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d mx20022_ci"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/mx20022_ci
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -34,4 +50,4 @@ jobs:
       - name: Coverage Gate
         run: |
           cargo install cargo-llvm-cov --version 0.6.16 --locked
-          cargo llvm-cov --workspace --summary-only --fail-under-lines 1
+          cargo llvm-cov --workspace --summary-only --fail-under-lines 55
