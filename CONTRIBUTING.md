@@ -1,15 +1,5 @@
 # Contributing
 
-Thanks for your interest in contributing to mx20022-runtime.
+Primary contributor guide: [`contributor.md`](contributor.md).
 
-## Development
-
-- Rust stable
-- `just check` for workspace checks
-- `just test` for test suite
-
-## PRs
-
-- Keep PRs focused
-- Add tests for behavior changes
-- Update docs where relevant
+Use this file as the canonical workflow/quality reference for local setup, testing gates, PR checklist, and contribution standards.

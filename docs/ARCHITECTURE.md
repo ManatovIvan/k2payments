@@ -1,5 +1,7 @@
 # Architecture
 
+Canonical architecture reference: [`/architecture.md`](../architecture.md).
+
 ## Overview
 
 `mx20022-runtime` is a production‑grade ISO 20022 payment processing runtime built on the `mx20022` library. It receives inbound messages via channels, runs them through a participant pipeline under a three‑phase lifecycle, and delivers outbound messages with full auditability.
