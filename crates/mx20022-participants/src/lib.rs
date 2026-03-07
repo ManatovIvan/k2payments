@@ -1,5 +1,13 @@
 //! Built-in participants for v0.1 foundations.
 
+pub(crate) fn escape_xml(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
 pub mod acknowledgement_builder;
 pub mod business_rule_validator;
 pub mod cbpr_rule_validator;

@@ -78,7 +78,23 @@ impl RuntimeConfig {
 
         let auth = &self.runtime.admin_auth;
         match auth.mode.as_str() {
-            "disabled" | "legacy_bearer" => {}
+            "disabled" => {}
+            "legacy_bearer" => {
+                tracing::warn!(
+                    "admin_auth.mode=legacy_bearer is insecure; consider jwt_hs256 or disabled"
+                );
+                if auth
+                    .legacy_bearer_token
+                    .as_ref()
+                    .map(|value| value.trim().is_empty())
+                    .unwrap_or(true)
+                {
+                    return Err(ConfigError::Validation(
+                        "runtime.admin_auth.legacy_bearer_token must be set when mode=legacy_bearer"
+                            .to_string(),
+                    ));
+                }
+            }
             "jwt_hs256" => {
                 if auth
                     .jwt_hs256_secret
@@ -139,6 +155,10 @@ pub struct RuntimeSection {
     pub recovery_startup_limit: Option<usize>,
     #[serde(default)]
     pub admin_auth: AdminAuthSection,
+    #[serde(default)]
+    pub admin_tls_cert: Option<String>,
+    #[serde(default)]
+    pub admin_tls_key: Option<String>,
 }
 
 fn default_log_level() -> String {
@@ -149,12 +169,16 @@ fn default_recover_incomplete_on_startup() -> bool {
     true
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct AdminAuthSection {
     #[serde(default = "default_admin_auth_mode")]
     pub mode: String,
     #[serde(default)]
     pub jwt_hs256_secret: Option<String>,
+    #[serde(default)]
+    pub legacy_bearer_token: Option<String>,
+    #[serde(default)]
+    pub legacy_readonly_token: Option<String>,
     #[serde(default)]
     pub jwt_issuer: Option<String>,
     #[serde(default)]
@@ -175,11 +199,45 @@ pub struct AdminAuthSection {
     pub mtls_allowed_subjects: Vec<String>,
 }
 
+impl std::fmt::Debug for AdminAuthSection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdminAuthSection")
+            .field("mode", &self.mode)
+            .field(
+                "jwt_hs256_secret",
+                &self.jwt_hs256_secret.as_ref().map(|_| "***redacted***"),
+            )
+            .field(
+                "legacy_bearer_token",
+                &self.legacy_bearer_token.as_ref().map(|_| "***redacted***"),
+            )
+            .field(
+                "legacy_readonly_token",
+                &self
+                    .legacy_readonly_token
+                    .as_ref()
+                    .map(|_| "***redacted***"),
+            )
+            .field("jwt_issuer", &self.jwt_issuer)
+            .field("jwt_audience", &self.jwt_audience)
+            .field("ready_roles", &self.ready_roles)
+            .field("status_roles", &self.status_roles)
+            .field("tx_roles", &self.tx_roles)
+            .field("reload_roles", &self.reload_roles)
+            .field("require_mtls_subject", &self.require_mtls_subject)
+            .field("mtls_subject_header", &self.mtls_subject_header)
+            .field("mtls_allowed_subjects", &self.mtls_allowed_subjects)
+            .finish()
+    }
+}
+
 impl Default for AdminAuthSection {
     fn default() -> Self {
         Self {
             mode: default_admin_auth_mode(),
             jwt_hs256_secret: None,
+            legacy_bearer_token: None,
+            legacy_readonly_token: None,
             jwt_issuer: None,
             jwt_audience: None,
             ready_roles: default_ready_roles(),
@@ -194,7 +252,7 @@ impl Default for AdminAuthSection {
 }
 
 fn default_admin_auth_mode() -> String {
-    "legacy_bearer".to_string()
+    "disabled".to_string()
 }
 
 fn default_ready_roles() -> Vec<String> {
@@ -484,9 +542,24 @@ mode = "disabled"
             r#"{BASE_CONFIG}
 [runtime.admin_auth]
 mode = "legacy_bearer"
+legacy_bearer_token = "admin-token"
 "#
         );
         assert!(RuntimeConfig::parse(&config).is_ok());
+    }
+
+    #[test]
+    fn rejects_legacy_bearer_mode_without_token() {
+        let config = format!(
+            r#"{BASE_CONFIG}
+[runtime.admin_auth]
+mode = "legacy_bearer"
+"#
+        );
+        assert_validation_error(
+            &config,
+            "runtime.admin_auth.legacy_bearer_token must be set when mode=legacy_bearer",
+        );
     }
 
     #[test]

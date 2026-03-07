@@ -1,15 +1,8 @@
-mod app;
-mod application;
-mod domain;
-mod engine;
-
 use std::env;
-use std::hash::{Hash, Hasher};
 use std::process;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use app::RuntimeApp;
 use async_trait::async_trait;
 use mx20022_admin::auth::{AuthConfig as AdminAuthConfig, AuthMode as AdminAuthMode};
 use mx20022_admin::controller::{AdminController, AdminControllerError};
@@ -18,7 +11,12 @@ use mx20022_admin::host;
 use mx20022_admin::service::{
     ReloadStatus, RuntimeReloader, RuntimeStatusSnapshot, StoreBackedAdminController,
 };
+use mx20022_admin::tls::TlsConfig as AdminTlsConfig;
 use mx20022_config::RuntimeConfig;
+use mx20022_runtime::app::RuntimeApp;
+use mx20022_runtime::engine;
+use sha2::{Digest, Sha256};
+use tokio::sync::RwLock;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -53,13 +51,13 @@ async fn run() -> Result<(), RuntimeBootstrapError> {
     tracing::info!(
         runtime = %app.runtime_name(),
         instance_id = %app.instance_id(),
-        pipelines = app.pipeline_count(),
+        pipelines = app.pipeline_count().await,
         channels = app.channel_names().len(),
         store_backend = %app.store_backend(),
         "runtime configuration loaded"
     );
 
-    tracing::debug!(pipelines = ?app.pipeline_names(), "pipeline names loaded");
+    tracing::debug!(pipelines = ?app.pipeline_names().await, "pipeline names loaded");
 
     if config.runtime.recover_incomplete_on_startup {
         let limit = config.runtime.recovery_startup_limit.unwrap_or(500);
@@ -84,83 +82,105 @@ async fn run() -> Result<(), RuntimeBootstrapError> {
         .clone()
         .unwrap_or_else(|| "127.0.0.1:9091".to_string());
     let admin_auth = build_admin_auth(&config);
+    let admin_tls = build_admin_tls(&config);
+    let service_mode = (cli.run_pipelines, cli.serve_admin, cli.serve_admin_grpc);
 
-    if cli.serve_admin && cli.serve_admin_grpc && cli.run_pipelines {
-        let controller =
-            build_admin_controller(&app, cli.config_path.clone(), Arc::clone(&reload_status));
-        tracing::info!(bind = %admin_bind, grpc_bind = %admin_grpc_bind, "starting admin http+grpc hosts and pipeline engine");
+    match service_mode {
+        (true, true, true) => {
+            let controller =
+                build_admin_controller(&app, cli.config_path.clone(), Arc::clone(&reload_status))
+                    .await;
+            tracing::info!(bind = %admin_bind, grpc_bind = %admin_grpc_bind, "starting admin http+grpc hosts and pipeline engine");
 
-        tokio::select! {
-            res = engine::run_pipelines(Arc::clone(&app), config.clone()) => {
-                res.map_err(RuntimeBootstrapError::Engine)?;
-            }
-            res = host::serve(&admin_bind, Arc::clone(&controller), admin_auth.clone()) => {
-                res.map_err(RuntimeBootstrapError::AdminHost)?;
-            }
-            res = grpc::serve(&admin_grpc_bind, controller, admin_auth.clone()) => {
-                res.map_err(RuntimeBootstrapError::AdminGrpcHost)?;
+            tokio::select! {
+                res = engine::run_pipelines(Arc::clone(&app), config.clone()) => {
+                    res.map_err(RuntimeBootstrapError::Engine)?;
+                }
+                res = host::serve_with_tls(&admin_bind, Arc::clone(&controller), admin_auth.clone(), admin_tls.clone()) => {
+                    res.map_err(RuntimeBootstrapError::AdminHost)?;
+                }
+                res = grpc::serve_with_tls(&admin_grpc_bind, controller, admin_auth.clone(), admin_tls.clone()) => {
+                    res.map_err(RuntimeBootstrapError::AdminGrpcHost)?;
+                }
             }
         }
-    } else if cli.serve_admin && cli.run_pipelines {
-        let controller =
-            build_admin_controller(&app, cli.config_path.clone(), Arc::clone(&reload_status));
-        tracing::info!(bind = %admin_bind, "starting admin host and pipeline engine");
+        (true, true, false) => {
+            let controller =
+                build_admin_controller(&app, cli.config_path.clone(), Arc::clone(&reload_status))
+                    .await;
+            tracing::info!(bind = %admin_bind, "starting admin host and pipeline engine");
 
-        tokio::select! {
-            res = engine::run_pipelines(Arc::clone(&app), config.clone()) => {
-                res.map_err(RuntimeBootstrapError::Engine)?;
-            }
-            res = host::serve(&admin_bind, controller, admin_auth.clone()) => {
-                res.map_err(RuntimeBootstrapError::AdminHost)?;
+            tokio::select! {
+                res = engine::run_pipelines(Arc::clone(&app), config.clone()) => {
+                    res.map_err(RuntimeBootstrapError::Engine)?;
+                }
+                res = host::serve_with_tls(&admin_bind, controller, admin_auth.clone(), admin_tls.clone()) => {
+                    res.map_err(RuntimeBootstrapError::AdminHost)?;
+                }
             }
         }
-    } else if cli.serve_admin_grpc && cli.run_pipelines {
-        let controller =
-            build_admin_controller(&app, cli.config_path.clone(), Arc::clone(&reload_status));
-        tracing::info!(grpc_bind = %admin_grpc_bind, "starting admin grpc host and pipeline engine");
+        (true, false, true) => {
+            let controller =
+                build_admin_controller(&app, cli.config_path.clone(), Arc::clone(&reload_status))
+                    .await;
+            tracing::info!(grpc_bind = %admin_grpc_bind, "starting admin grpc host and pipeline engine");
 
-        tokio::select! {
-            res = engine::run_pipelines(Arc::clone(&app), config.clone()) => {
-                res.map_err(RuntimeBootstrapError::Engine)?;
-            }
-            res = grpc::serve(&admin_grpc_bind, controller, admin_auth.clone()) => {
-                res.map_err(RuntimeBootstrapError::AdminGrpcHost)?;
+            tokio::select! {
+                res = engine::run_pipelines(Arc::clone(&app), config.clone()) => {
+                    res.map_err(RuntimeBootstrapError::Engine)?;
+                }
+                res = grpc::serve_with_tls(&admin_grpc_bind, controller, admin_auth.clone(), admin_tls.clone()) => {
+                    res.map_err(RuntimeBootstrapError::AdminGrpcHost)?;
+                }
             }
         }
-    } else if cli.run_pipelines {
-        tracing::info!("starting pipeline engine");
-        engine::run_pipelines(Arc::clone(&app), config)
-            .await
-            .map_err(RuntimeBootstrapError::Engine)?;
-    } else if cli.serve_admin && cli.serve_admin_grpc {
-        let controller =
-            build_admin_controller(&app, cli.config_path.clone(), Arc::clone(&reload_status));
-        tracing::info!(bind = %admin_bind, grpc_bind = %admin_grpc_bind, "starting admin http+grpc hosts");
+        (true, false, false) => {
+            tracing::info!("starting pipeline engine");
+            engine::run_pipelines(Arc::clone(&app), config.clone())
+                .await
+                .map_err(RuntimeBootstrapError::Engine)?;
+        }
+        (false, true, true) => {
+            let controller =
+                build_admin_controller(&app, cli.config_path.clone(), Arc::clone(&reload_status))
+                    .await;
+            tracing::info!(bind = %admin_bind, grpc_bind = %admin_grpc_bind, "starting admin http+grpc hosts");
 
-        tokio::select! {
-            res = host::serve(&admin_bind, Arc::clone(&controller), admin_auth.clone()) => {
-                res.map_err(RuntimeBootstrapError::AdminHost)?;
-            }
-            res = grpc::serve(&admin_grpc_bind, controller, admin_auth.clone()) => {
-                res.map_err(RuntimeBootstrapError::AdminGrpcHost)?;
+            tokio::select! {
+                res = host::serve_with_tls(&admin_bind, Arc::clone(&controller), admin_auth.clone(), admin_tls.clone()) => {
+                    res.map_err(RuntimeBootstrapError::AdminHost)?;
+                }
+                res = grpc::serve_with_tls(&admin_grpc_bind, controller, admin_auth.clone(), admin_tls.clone()) => {
+                    res.map_err(RuntimeBootstrapError::AdminGrpcHost)?;
+                }
             }
         }
-    } else if cli.serve_admin {
-        let controller =
-            build_admin_controller(&app, cli.config_path.clone(), Arc::clone(&reload_status));
-        tracing::info!(bind = %admin_bind, "starting admin host");
-        host::serve(&admin_bind, controller, admin_auth.clone())
+        (false, true, false) => {
+            let controller =
+                build_admin_controller(&app, cli.config_path.clone(), Arc::clone(&reload_status))
+                    .await;
+            tracing::info!(bind = %admin_bind, "starting admin host");
+            host::serve_with_tls(
+                &admin_bind,
+                controller,
+                admin_auth.clone(),
+                admin_tls.clone(),
+            )
             .await
             .map_err(RuntimeBootstrapError::AdminHost)?;
-    } else if cli.serve_admin_grpc {
-        let controller =
-            build_admin_controller(&app, cli.config_path.clone(), Arc::clone(&reload_status));
-        tracing::info!(grpc_bind = %admin_grpc_bind, "starting admin grpc host");
-        grpc::serve(&admin_grpc_bind, controller, admin_auth)
-            .await
-            .map_err(RuntimeBootstrapError::AdminGrpcHost)?;
-    } else {
-        tracing::info!("mxruntime initialized with no active services (--no-pipelines)");
+        }
+        (false, false, true) => {
+            let controller =
+                build_admin_controller(&app, cli.config_path.clone(), Arc::clone(&reload_status))
+                    .await;
+            tracing::info!(grpc_bind = %admin_grpc_bind, "starting admin grpc host");
+            grpc::serve_with_tls(&admin_grpc_bind, controller, admin_auth, admin_tls)
+                .await
+                .map_err(RuntimeBootstrapError::AdminGrpcHost)?;
+        }
+        (false, false, false) => {
+            tracing::info!("mxruntime initialized with no active services (--no-pipelines)");
+        }
     }
 
     Ok(())
@@ -222,9 +242,7 @@ fn spawn_participant_reload_watcher(
             match app.reload_participant_configs(&config).await {
                 Ok(report) => {
                     mx20022_metrics::record_runtime_config_reload("success");
-                    let mut status = reload_status
-                        .write()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let mut status = reload_status.write().await;
                     status.config_version = format!("h{:016x}", hash);
                     status.last_result = Some("success".to_string());
                     status.last_reloaded_at = Some(SystemTime::now());
@@ -237,9 +255,7 @@ fn spawn_participant_reload_watcher(
                 Err(error) => {
                     mx20022_metrics::record_runtime_config_reload("error");
                     mx20022_metrics::record_runtime_config_reload_error("apply");
-                    let mut status = reload_status
-                        .write()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let mut status = reload_status.write().await;
                     status.last_result = Some(format!("error:{error}"));
                     status.last_reloaded_at = Some(SystemTime::now());
                     tracing::warn!(error = %error, "participant reload watcher rejected config update");
@@ -250,21 +266,46 @@ fn spawn_participant_reload_watcher(
 }
 
 fn hash_bytes(bytes: &[u8]) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    bytes.hash(&mut hasher);
-    hasher.finish()
+    let digest = Sha256::digest(bytes);
+    u64::from_be_bytes([
+        digest[0], digest[1], digest[2], digest[3], digest[4], digest[5], digest[6], digest[7],
+    ])
+}
+
+fn build_admin_tls(config: &RuntimeConfig) -> Option<AdminTlsConfig> {
+    admin_tls_pair(config).map(|(cert_path, key_path)| AdminTlsConfig {
+        cert_path,
+        key_path,
+    })
+}
+
+fn admin_tls_pair(config: &RuntimeConfig) -> Option<(String, String)> {
+    match (
+        &config.runtime.admin_tls_cert,
+        &config.runtime.admin_tls_key,
+    ) {
+        (Some(cert), Some(key)) => Some((cert.clone(), key.clone())),
+        (None, None) => None,
+        _ => {
+            tracing::error!("admin_tls_cert and admin_tls_key must both be set or both be absent");
+            None
+        }
+    }
 }
 
 fn build_admin_auth(config: &RuntimeConfig) -> AdminAuthConfig {
     let mode = match config.runtime.admin_auth.mode.as_str() {
         "disabled" => AdminAuthMode::Disabled,
+        "legacy_bearer" => AdminAuthMode::LegacyBearer,
         "jwt_hs256" => AdminAuthMode::JwtHs256,
-        _ => AdminAuthMode::LegacyBearer,
+        _ => AdminAuthMode::Disabled,
     };
 
     AdminAuthConfig {
         mode,
         jwt_hs256_secret: config.runtime.admin_auth.jwt_hs256_secret.clone(),
+        legacy_bearer_token: config.runtime.admin_auth.legacy_bearer_token.clone(),
+        legacy_readonly_token: config.runtime.admin_auth.legacy_readonly_token.clone(),
         jwt_issuer: config.runtime.admin_auth.jwt_issuer.clone(),
         jwt_audience: config.runtime.admin_auth.jwt_audience.clone(),
         ready_roles: config.runtime.admin_auth.ready_roles.clone(),
@@ -277,7 +318,7 @@ fn build_admin_auth(config: &RuntimeConfig) -> AdminAuthConfig {
     }
 }
 
-fn build_admin_controller(
+async fn build_admin_controller(
     app: &Arc<RuntimeApp>,
     config_path: String,
     reload_status: Arc<RwLock<ReloadStatus>>,
@@ -292,7 +333,7 @@ fn build_admin_controller(
             app.store_handle(),
             RuntimeStatusSnapshot {
                 runtime: app.runtime_name().to_string(),
-                pipelines: app.pipeline_names(),
+                pipelines: app.pipeline_names().await,
                 channels: app.channel_names(),
                 store: app.store_backend().to_string(),
                 started_at: SystemTime::now(),
@@ -312,10 +353,15 @@ struct AppConfigReloader {
 #[async_trait]
 impl RuntimeReloader for AppConfigReloader {
     async fn reload(&self) -> Result<String, AdminControllerError> {
-        let raw = std::fs::read_to_string(&self.config_path).map_err(|error| {
+        let bytes = tokio::fs::read(&self.config_path).await.map_err(|error| {
             mx20022_metrics::record_runtime_config_reload("error");
             mx20022_metrics::record_runtime_config_reload_error("read");
             AdminControllerError::Internal(format!("reload failed to read config: {error}"))
+        })?;
+        let raw = String::from_utf8(bytes).map_err(|error| {
+            mx20022_metrics::record_runtime_config_reload("error");
+            mx20022_metrics::record_runtime_config_reload_error("utf8");
+            AdminControllerError::Internal(format!("reload failed to decode UTF-8 config: {error}"))
         })?;
         let version_hash = hash_bytes(raw.as_bytes());
         let config = RuntimeConfig::parse(&raw).map_err(|error| {
@@ -324,27 +370,22 @@ impl RuntimeReloader for AppConfigReloader {
             AdminControllerError::Internal(format!("reload failed to parse config: {error}"))
         })?;
 
-        let report = self
-            .app
-            .reload_participant_configs(&config)
-            .await
-            .map_err(|error| {
+        let report = match self.app.reload_participant_configs(&config).await {
+            Ok(report) => report,
+            Err(error) => {
                 mx20022_metrics::record_runtime_config_reload("error");
                 mx20022_metrics::record_runtime_config_reload_error("apply");
-                let mut status = self
-                    .reload_status
-                    .write()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let mut status = self.reload_status.write().await;
                 status.last_result = Some(format!("error:{error}"));
                 status.last_reloaded_at = Some(SystemTime::now());
-                AdminControllerError::Internal(format!("reload failed: {error}"))
-            })?;
+                return Err(AdminControllerError::Internal(format!(
+                    "reload failed: {error}"
+                )));
+            }
+        };
 
         mx20022_metrics::record_runtime_config_reload("success");
-        let mut status = self
-            .reload_status
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut status = self.reload_status.write().await;
         status.config_version = format!("h{:016x}", version_hash);
         status.last_result = Some("success".to_string());
         status.last_reloaded_at = Some(SystemTime::now());
@@ -418,7 +459,7 @@ enum RuntimeBootstrapError {
     #[error(transparent)]
     Config(#[from] mx20022_config::ConfigError),
     #[error(transparent)]
-    Build(#[from] app::RuntimeBuildError),
+    Build(#[from] mx20022_runtime::app::RuntimeBuildError),
     #[error(transparent)]
     AdminHost(#[from] mx20022_admin::host::HostError),
     #[error(transparent)]

@@ -1,13 +1,22 @@
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::header::{
+    CONTENT_SECURITY_POLICY, REFERRER_POLICY, STRICT_TRANSPORT_SECURITY, X_CONTENT_TYPE_OPTIONS,
+    X_FRAME_OPTIONS,
+};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
+use axum::middleware::map_response;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use tower_http::cors::{Any, CorsLayer};
 
 use crate::auth::{authorize_request, AdminResource, AuthConfig, AuthError};
 use crate::controller::{AdminController, AdminControllerError};
+use crate::tls::TlsConfig;
+
+const MAX_ADMIN_BODY_BYTES: usize = 10 * 1024 * 1024;
 
 #[derive(Clone)]
 struct HostState {
@@ -20,6 +29,15 @@ pub async fn serve(
     controller: Arc<dyn AdminController>,
     auth: AuthConfig,
 ) -> Result<(), HostError> {
+    serve_with_tls(addr, controller, auth, None).await
+}
+
+pub async fn serve_with_tls(
+    addr: &str,
+    controller: Arc<dyn AdminController>,
+    auth: AuthConfig,
+    tls: Option<TlsConfig>,
+) -> Result<(), HostError> {
     let state = HostState { controller, auth };
 
     let router = Router::new()
@@ -29,15 +47,62 @@ pub async fn serve(
         .route("/reload", post(reload_config))
         .route("/tx/:tx_id", get(get_tx))
         .route("/metrics", get(get_metrics))
+        .layer(
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods([Method::GET, Method::POST])
+                .allow_headers(Any),
+        )
+        .layer(map_response(add_security_headers))
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_ADMIN_BODY_BYTES))
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .map_err(|e| HostError::Bind(addr.to_string(), e.to_string()))?;
+    if let Some(tls) = tls {
+        let config =
+            axum_server::tls_rustls::RustlsConfig::from_pem_file(&tls.cert_path, &tls.key_path)
+                .await
+                .map_err(|e| HostError::Tls(e.to_string()))?;
 
-    axum::serve(listener, router)
-        .await
-        .map_err(|e| HostError::Serve(e.to_string()))
+        let socket: std::net::SocketAddr =
+            addr.parse().map_err(|e: std::net::AddrParseError| {
+                HostError::Bind(addr.to_string(), e.to_string())
+            })?;
+
+        tracing::info!(addr = %addr, "admin host starting with TLS");
+        axum_server::bind_rustls(socket, config)
+            .serve(router.into_make_service())
+            .await
+            .map_err(|e| HostError::Serve(e.to_string()))
+    } else {
+        tracing::warn!("admin host starting without TLS");
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(|e| HostError::Bind(addr.to_string(), e.to_string()))?;
+
+        axum::serve(listener, router)
+            .await
+            .map_err(|e| HostError::Serve(e.to_string()))
+    }
+}
+
+async fn add_security_headers(mut response: axum::response::Response) -> axum::response::Response {
+    let headers = response.headers_mut();
+    headers.insert(
+        STRICT_TRANSPORT_SECURITY,
+        HeaderValue::from_static("max-age=31536000; includeSubDomains"),
+    );
+    headers.insert(X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    headers.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    headers.insert(REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+    headers.insert(
+        CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("default-src 'none'; frame-ancestors 'none'"),
+    );
+    headers.insert(
+        HeaderName::from_static("permissions-policy"),
+        HeaderValue::from_static("accelerometer=(), camera=(), geolocation=(), microphone=()"),
+    );
+    response
 }
 
 async fn get_metrics() -> impl IntoResponse {
@@ -185,10 +250,13 @@ fn map_error(error: AdminControllerError) -> (StatusCode, Json<serde_json::Value
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({"error": "forbidden"})),
         ),
-        AdminControllerError::Internal(message) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": message})),
-        ),
+        AdminControllerError::Internal(message) => {
+            tracing::error!(error = %message, "admin request failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "internal server error"})),
+            )
+        }
     }
 }
 
@@ -215,4 +283,6 @@ pub enum HostError {
     Bind(String, String),
     #[error("failed to serve admin host: {0}")]
     Serve(String),
+    #[error("TLS configuration error: {0}")]
+    Tls(String),
 }

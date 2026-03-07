@@ -104,6 +104,16 @@ pub trait Store: Send + Sync {
         tx_id: &str,
         entry: ContextEntry,
     ) -> Result<(), StoreError>;
+    async fn batch_append_context_entries(
+        &self,
+        tx_id: &str,
+        entries: &[ContextEntry],
+    ) -> Result<(), StoreError> {
+        for entry in entries {
+            self.append_context_entry(tx_id, entry.clone()).await?;
+        }
+        Ok(())
+    }
     async fn list_context_entries(&self, tx_id: &str) -> Result<Vec<ContextEntry>, StoreError>;
 
     async fn find_by_id(&self, tx_id: &str) -> Result<Option<TransactionRecord>, StoreError>;
@@ -117,6 +127,9 @@ pub trait Store: Send + Sync {
 
     async fn save_expectation(&self, exp: &Expectation) -> Result<(), StoreError>;
     async fn load_pending_expectations(&self) -> Result<Vec<Expectation>, StoreError>;
+    async fn count_pending_expectations(&self) -> Result<usize, StoreError> {
+        Ok(self.load_pending_expectations().await?.len())
+    }
     async fn update_expectation(&self, id: &str, update: ExpUpdate) -> Result<(), StoreError>;
 
     async fn save_dead_letter(&self, letter: &DeadLetter) -> Result<(), StoreError>;
@@ -124,7 +137,34 @@ pub trait Store: Send + Sync {
         &self,
         filter: DeadLetterQuery,
     ) -> Result<Vec<DeadLetter>, StoreError>;
+    async fn count_dead_letters(&self, pipeline: Option<&str>) -> Result<usize, StoreError> {
+        Ok(self
+            .list_dead_letters(DeadLetterQuery {
+                pipeline: pipeline.map(ToString::to_string),
+                limit: None,
+            })
+            .await?
+            .len())
+    }
     async fn replay_dead_letter(&self, id: &str) -> Result<(), StoreError>;
+
+    async fn count_transactions_by_states(&self, states: &[&str]) -> Result<usize, StoreError> {
+        let mut total = 0usize;
+        for state in states {
+            let result = self
+                .query(StoreQuery {
+                    pipeline: None,
+                    message_type: None,
+                    state: Some((*state).to_string()),
+                    since: None,
+                    until: None,
+                    limit: None,
+                })
+                .await?;
+            total = total.saturating_add(result.total);
+        }
+        Ok(total)
+    }
 
     async fn health(&self) -> Result<StoreHealth, StoreError>;
     async fn compact(&self) -> Result<(), StoreError>;

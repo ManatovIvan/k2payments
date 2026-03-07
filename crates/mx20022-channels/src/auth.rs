@@ -12,7 +12,7 @@ pub enum InboundAuthMode {
     JwtHs256,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct InboundAuthConfig {
     pub mode: InboundAuthMode,
     pub bearer_token: Option<String>,
@@ -23,6 +23,28 @@ pub struct InboundAuthConfig {
     pub require_mtls_subject: bool,
     pub mtls_subject_header: String,
     pub mtls_allowed_subjects: Vec<String>,
+}
+
+impl std::fmt::Debug for InboundAuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InboundAuthConfig")
+            .field("mode", &self.mode)
+            .field(
+                "bearer_token",
+                &self.bearer_token.as_ref().map(|_| "***redacted***"),
+            )
+            .field(
+                "jwt_hs256_secret",
+                &self.jwt_hs256_secret.as_ref().map(|_| "***redacted***"),
+            )
+            .field("jwt_issuer", &self.jwt_issuer)
+            .field("jwt_audience", &self.jwt_audience)
+            .field("required_roles", &self.required_roles)
+            .field("require_mtls_subject", &self.require_mtls_subject)
+            .field("mtls_subject_header", &self.mtls_subject_header)
+            .field("mtls_allowed_subjects", &self.mtls_allowed_subjects)
+            .finish()
+    }
 }
 
 impl Default for InboundAuthConfig {

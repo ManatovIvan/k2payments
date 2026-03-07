@@ -1,8 +1,8 @@
 use std::collections::HashMap;
-use std::sync::Mutex;
 use std::time::Instant;
 
 use async_trait::async_trait;
+use tokio::sync::Mutex;
 
 use mx20022_runtime_core::{
     context::Context,
@@ -57,10 +57,7 @@ impl Participant for RateLimiter {
     async fn prepare(&self, ctx: &mut Context) -> Result<Action, ParticipantError> {
         let now = Instant::now();
         let key = self.bucket_key(ctx);
-        let mut buckets = self
-            .buckets
-            .lock()
-            .map_err(|_| ParticipantError::new("rate-limiter: lock poisoned"))?;
+        let mut buckets = self.buckets.lock().await;
 
         let bucket = buckets.entry(key).or_insert(Bucket {
             tokens: self.burst,

@@ -6,6 +6,7 @@ use mx20022_store::{
     ContextEntry, DeadLetter, DeadLetterQuery, ExpUpdate, Expectation, Outcome, QueryResult, Store,
     StoreError, StoreHealth, StoreQuery, TransactionRecord, TransactionUpdate,
 };
+use sqlx::postgres::PgPoolOptions;
 use sqlx::{Pool, Postgres, QueryBuilder, Row};
 
 const INIT_SQL: &str = r#"
@@ -48,6 +49,8 @@ CREATE TABLE IF NOT EXISTS dead_letters (
 
 CREATE INDEX IF NOT EXISTS idx_transactions_message_type ON transactions(message_type);
 CREATE INDEX IF NOT EXISTS idx_transactions_state ON transactions(state);
+CREATE INDEX IF NOT EXISTS idx_transactions_pipeline ON transactions(pipeline);
+CREATE INDEX IF NOT EXISTS idx_transactions_key_fields_json_gin ON transactions USING GIN (key_fields_json);
 CREATE INDEX IF NOT EXISTS idx_expectations_state_timeout ON expectations(state, timeout_at);
 "#;
 
@@ -76,24 +79,31 @@ ON CONFLICT (tx_id) DO NOTHING;
 "#;
 
 pub struct PostgresStore {
-    database_url: String,
     pool: Pool<Postgres>,
 }
 
 impl PostgresStore {
     pub async fn connect(database_url: impl Into<String>) -> Result<Self, StoreError> {
+        Self::connect_with_pool_size(database_url, None).await
+    }
+
+    pub async fn connect_with_pool_size(
+        database_url: impl Into<String>,
+        pool_size: Option<u32>,
+    ) -> Result<Self, StoreError> {
         let database_url = database_url.into();
-        let pool = sqlx::PgPool::connect(&database_url)
+        let mut pool_builder = PgPoolOptions::new();
+        if let Some(size) = pool_size {
+            pool_builder = pool_builder.max_connections(size.max(1));
+        }
+        let pool = pool_builder
+            .connect(&database_url)
             .await
             .map_err(|e| StoreError::new(format!("failed to connect postgres: {e}")))?;
 
         execute_batch(&pool, INIT_SQL, "postgres init").await?;
 
-        Ok(Self { database_url, pool })
-    }
-
-    pub fn database_url(&self) -> &str {
-        &self.database_url
+        Ok(Self { pool })
     }
 
     pub async fn apply_migrations(&self) -> Result<(), StoreError> {
@@ -269,6 +279,30 @@ impl Store for PostgresStore {
         .await
         .map_err(|e| StoreError::new(format!("append_context_entry failed: {e}")))?;
 
+        Ok(())
+    }
+
+    async fn batch_append_context_entries(
+        &self,
+        tx_id: &str,
+        entries: &[ContextEntry],
+    ) -> Result<(), StoreError> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let mut qb = QueryBuilder::<Postgres>::new(
+            "INSERT INTO context_mutations (tx_id, key, writer, written_at) ",
+        );
+        qb.push_values(entries, |mut b, entry| {
+            b.push_bind(tx_id.to_string())
+                .push_bind(entry.key.clone())
+                .push_bind(entry.writer.clone())
+                .push_bind(encode_time(entry.written_at));
+        });
+        qb.build()
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StoreError::new(format!("batch_append_context_entries failed: {e}")))?;
         Ok(())
     }
 
@@ -479,26 +513,27 @@ impl Store for PostgresStore {
         Ok(result)
     }
 
-    async fn update_expectation(&self, id: &str, update: ExpUpdate) -> Result<(), StoreError> {
-        if let Some(state) = update.state {
-            sqlx::query("UPDATE expectations SET state = $1 WHERE id = $2")
-                .bind(state)
-                .bind(id)
-                .execute(&self.pool)
-                .await
-                .map_err(|e| StoreError::new(format!("update_expectation state failed: {e}")))?;
-        }
+    async fn count_pending_expectations(&self) -> Result<usize, StoreError> {
+        let row = sqlx::query("SELECT COUNT(*) as total FROM expectations WHERE state = 'PENDING'")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| StoreError::new(format!("count_pending_expectations failed: {e}")))?;
+        let total = row.try_get::<i64, _>("total").map_err(|e| {
+            StoreError::new(format!("count_pending_expectations mapping failed: {e}"))
+        })?;
+        Ok(usize::try_from(total.max(0)).unwrap_or(usize::MAX))
+    }
 
-        if let Some(matched_tx_id) = update.matched_tx_id {
-            sqlx::query("UPDATE expectations SET matched_tx_id = $1 WHERE id = $2")
-                .bind(matched_tx_id)
-                .bind(id)
-                .execute(&self.pool)
-                .await
-                .map_err(|e| {
-                    StoreError::new(format!("update_expectation matched_tx_id failed: {e}"))
-                })?;
-        }
+    async fn update_expectation(&self, id: &str, update: ExpUpdate) -> Result<(), StoreError> {
+        sqlx::query(
+            "UPDATE expectations SET state = COALESCE($1, state), matched_tx_id = COALESCE($2, matched_tx_id) WHERE id = $3",
+        )
+        .bind(update.state)
+        .bind(update.matched_tx_id)
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StoreError::new(format!("update_expectation failed: {e}")))?;
 
         Ok(())
     }
@@ -529,51 +564,48 @@ impl Store for PostgresStore {
         &self,
         filter: DeadLetterQuery,
     ) -> Result<Vec<DeadLetter>, StoreError> {
-        let rows = sqlx::query(
-            "SELECT dl.id, dl.tx_id, dl.reason, dl.failed_at, dl.raw_message, tx.pipeline
+        let mut qb = QueryBuilder::<Postgres>::new(
+            "SELECT dl.id, dl.tx_id, dl.reason, dl.failed_at, dl.raw_message
              FROM dead_letters dl
-             LEFT JOIN transactions tx ON tx.tx_id = dl.tx_id
-             ORDER BY dl.failed_at DESC",
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| StoreError::new(format!("list_dead_letters failed: {e}")))?;
-
-        let mut result = Vec::new();
-        for row in rows {
-            let pipeline: Option<String> = row.try_get("pipeline").ok();
-            if let Some(ref required) = filter.pipeline {
-                if pipeline.as_deref() != Some(required.as_str()) {
-                    continue;
-                }
-            }
-
-            result.push(DeadLetter {
-                id: row
-                    .try_get("id")
-                    .map_err(|e| StoreError::new(format!("dead letter id map failed: {e}")))?,
-                tx_id: row
-                    .try_get("tx_id")
-                    .map_err(|e| StoreError::new(format!("dead letter tx_id map failed: {e}")))?,
-                reason: row
-                    .try_get("reason")
-                    .map_err(|e| StoreError::new(format!("dead letter reason map failed: {e}")))?,
-                failed_at: decode_time(row.try_get("failed_at").map_err(|e| {
-                    StoreError::new(format!("dead letter failed_at map failed: {e}"))
-                })?),
-                raw_message: row.try_get("raw_message").map_err(|e| {
-                    StoreError::new(format!("dead letter raw_message map failed: {e}"))
-                })?,
-            });
-
-            if let Some(limit) = filter.limit {
-                if result.len() >= limit {
-                    break;
-                }
-            }
+             LEFT JOIN transactions tx ON tx.tx_id = dl.tx_id",
+        );
+        if let Some(pipeline) = &filter.pipeline {
+            qb.push(" WHERE tx.pipeline = ");
+            qb.push_bind(pipeline);
+        }
+        qb.push(" ORDER BY dl.failed_at DESC");
+        if let Some(limit) = filter.limit {
+            qb.push(" LIMIT ");
+            qb.push_bind(i64::try_from(limit).unwrap_or(i64::MAX));
         }
 
-        Ok(result)
+        let rows = qb
+            .build()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::new(format!("list_dead_letters failed: {e}")))?;
+
+        rows.into_iter()
+            .map(|row| {
+                Ok(DeadLetter {
+                    id: row
+                        .try_get("id")
+                        .map_err(|e| StoreError::new(format!("dead letter id map failed: {e}")))?,
+                    tx_id: row.try_get("tx_id").map_err(|e| {
+                        StoreError::new(format!("dead letter tx_id map failed: {e}"))
+                    })?,
+                    reason: row.try_get("reason").map_err(|e| {
+                        StoreError::new(format!("dead letter reason map failed: {e}"))
+                    })?,
+                    failed_at: decode_time(row.try_get("failed_at").map_err(|e| {
+                        StoreError::new(format!("dead letter failed_at map failed: {e}"))
+                    })?),
+                    raw_message: row.try_get("raw_message").map_err(|e| {
+                        StoreError::new(format!("dead letter raw_message map failed: {e}"))
+                    })?,
+                })
+            })
+            .collect()
     }
 
     async fn replay_dead_letter(&self, id: &str) -> Result<(), StoreError> {
@@ -590,6 +622,51 @@ impl Store for PostgresStore {
         Ok(())
     }
 
+    async fn count_dead_letters(&self, pipeline: Option<&str>) -> Result<usize, StoreError> {
+        let mut qb = QueryBuilder::<Postgres>::new(
+            "SELECT COUNT(*) as total
+             FROM dead_letters dl
+             LEFT JOIN transactions tx ON tx.tx_id = dl.tx_id",
+        );
+        if let Some(pipeline) = pipeline {
+            qb.push(" WHERE tx.pipeline = ");
+            qb.push_bind(pipeline);
+        }
+        let row = qb
+            .build()
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| StoreError::new(format!("count_dead_letters failed: {e}")))?;
+        let total = row
+            .try_get::<i64, _>("total")
+            .map_err(|e| StoreError::new(format!("count_dead_letters mapping failed: {e}")))?;
+        Ok(usize::try_from(total.max(0)).unwrap_or(usize::MAX))
+    }
+
+    async fn count_transactions_by_states(&self, states: &[&str]) -> Result<usize, StoreError> {
+        if states.is_empty() {
+            return Ok(0);
+        }
+        let mut qb = QueryBuilder::<Postgres>::new(
+            "SELECT COUNT(*) as total FROM transactions WHERE state IN (",
+        );
+        {
+            let mut separated = qb.separated(", ");
+            for state in states {
+                separated.push_bind(*state);
+            }
+        }
+        qb.push(")");
+        let row =
+            qb.build().fetch_one(&self.pool).await.map_err(|e| {
+                StoreError::new(format!("count_transactions_by_states failed: {e}"))
+            })?;
+        let total = row.try_get::<i64, _>("total").map_err(|e| {
+            StoreError::new(format!("count_transactions_by_states mapping failed: {e}"))
+        })?;
+        Ok(usize::try_from(total.max(0)).unwrap_or(usize::MAX))
+    }
+
     async fn health(&self) -> Result<StoreHealth, StoreError> {
         let _ = sqlx::query("SELECT 1")
             .fetch_one(&self.pool)
@@ -599,7 +676,7 @@ impl Store for PostgresStore {
         Ok(StoreHealth {
             ok: true,
             backend: "postgres".to_string(),
-            details: Some(format!("database_url={}", self.database_url())),
+            details: Some("backend=postgres".to_string()),
         })
     }
 
@@ -609,5 +686,186 @@ impl Store for PostgresStore {
             .await
             .map_err(|e| StoreError::new(format!("compact failed: {e}")))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::time::SystemTime;
+
+    use mx20022_store::{
+        ContextEntry, DeadLetter, DeadLetterQuery, ExpUpdate, Expectation, Outcome, Store,
+        TransactionRecord, TransactionUpdate,
+    };
+
+    use super::PostgresStore;
+
+    fn record(tx_id: &str) -> TransactionRecord {
+        let mut key_fields = HashMap::new();
+        key_fields.insert("message_id".to_string(), format!("MSG-{tx_id}"));
+        key_fields.insert("end_to_end_id".to_string(), format!("E2E-{tx_id}"));
+        key_fields.insert("uetr".to_string(), format!("UETR-{tx_id}"));
+
+        TransactionRecord {
+            tx_id: tx_id.to_string(),
+            pipeline: "demo".to_string(),
+            source_channel: "http".to_string(),
+            message_type: "pacs.008.001.13".to_string(),
+            raw_message: "<Document/>".to_string(),
+            state: "RECEIVED".to_string(),
+            received_at: SystemTime::now(),
+            completed_at: None,
+            key_fields,
+        }
+    }
+
+    async fn connect_or_skip() -> Option<PostgresStore> {
+        let url = match std::env::var("DATABASE_URL") {
+            Ok(url) if url.starts_with("postgres") => url,
+            _ => return None,
+        };
+        PostgresStore::connect(url).await.ok()
+    }
+
+    #[tokio::test]
+    async fn roundtrip_transaction() {
+        let Some(store) = connect_or_skip().await else {
+            eprintln!("skipping postgres test: DATABASE_URL not set");
+            return;
+        };
+
+        let tx = record("pg-1");
+        store
+            .begin_transaction(&tx)
+            .await
+            .expect("begin should work");
+
+        let found = store
+            .find_by_id("pg-1")
+            .await
+            .expect("query should work")
+            .expect("record should exist");
+        assert_eq!(found.tx_id, "pg-1");
+        assert_eq!(found.state, "RECEIVED");
+
+        store
+            .update_transaction(
+                "pg-1",
+                TransactionUpdate {
+                    state: Some("PREPARING".to_string()),
+                    error: None,
+                },
+            )
+            .await
+            .expect("update should work");
+
+        store
+            .complete_transaction("pg-1", Outcome::Committed)
+            .await
+            .expect("complete should work");
+
+        let updated = store
+            .find_by_id("pg-1")
+            .await
+            .expect("query should work")
+            .expect("record should exist");
+        assert_eq!(updated.state, "COMMITTED");
+        assert!(updated.completed_at.is_some());
+
+        // cleanup
+        let _ = sqlx::query("DELETE FROM transactions WHERE tx_id = 'pg-1'")
+            .execute(&store.pool)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn expectation_and_dead_letter_roundtrip() {
+        let Some(store) = connect_or_skip().await else {
+            eprintln!("skipping postgres test: DATABASE_URL not set");
+            return;
+        };
+
+        let tx = record("pg-2");
+        store
+            .begin_transaction(&tx)
+            .await
+            .expect("begin should work");
+
+        store
+            .append_context_entry(
+                "pg-2",
+                ContextEntry {
+                    tx_id: "pg-2".to_string(),
+                    key: "routing.destination".to_string(),
+                    writer: "routing-engine".to_string(),
+                    written_at: SystemTime::now(),
+                },
+            )
+            .await
+            .expect("append context should work");
+
+        let entries = store
+            .list_context_entries("pg-2")
+            .await
+            .expect("list context should work");
+        assert!(!entries.is_empty());
+
+        store
+            .save_expectation(&Expectation {
+                id: "EXP-PG-1".to_string(),
+                correlation_key: "MSG-pg-2".to_string(),
+                expected_message_type: "pacs.002".to_string(),
+                timeout_at: SystemTime::now(),
+            })
+            .await
+            .expect("save expectation should work");
+
+        store
+            .update_expectation(
+                "EXP-PG-1",
+                ExpUpdate {
+                    state: Some("MATCHED".to_string()),
+                    matched_tx_id: Some("pg-2".to_string()),
+                },
+            )
+            .await
+            .expect("update expectation should work");
+
+        store
+            .save_dead_letter(&DeadLetter {
+                id: "DL-PG-1".to_string(),
+                tx_id: "pg-2".to_string(),
+                reason: "test failure".to_string(),
+                failed_at: SystemTime::now(),
+                raw_message: "<Document/>".to_string(),
+            })
+            .await
+            .expect("save dead letter should work");
+
+        let dead_letters = store
+            .list_dead_letters(DeadLetterQuery {
+                pipeline: Some("demo".to_string()),
+                limit: Some(10),
+            })
+            .await
+            .expect("list dead letters should work");
+        assert!(!dead_letters.is_empty());
+
+        store
+            .replay_dead_letter("DL-PG-1")
+            .await
+            .expect("replay dead letter should work");
+
+        // cleanup
+        let _ = sqlx::query("DELETE FROM expectations WHERE id = 'EXP-PG-1'")
+            .execute(&store.pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM context_mutations WHERE tx_id = 'pg-2'")
+            .execute(&store.pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM transactions WHERE tx_id = 'pg-2'")
+            .execute(&store.pool)
+            .await;
     }
 }

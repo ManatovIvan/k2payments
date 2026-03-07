@@ -21,13 +21,16 @@ impl StatusResponseBuilder {
     }
 
     fn build_status_xml(&self, ctx: &Context, tx_status: &str, reason: Option<&str>) -> String {
+        let tx_id = crate::escape_xml(ctx.transaction_id());
         let reason_xml = reason
-            .map(|r| format!("<StsRsnInf><Rsn><Prtry>{r}</Prtry></Rsn></StsRsnInf>"))
+            .map(|r| {
+                let r = crate::escape_xml(r);
+                format!("<StsRsnInf><Rsn><Prtry>{r}</Prtry></Rsn></StsRsnInf>")
+            })
             .unwrap_or_default();
 
         format!(
             "<Document><FIToFIPmtStsRpt><GrpHdr><MsgId>{tx_id}</MsgId></GrpHdr><TxInfAndSts><OrgnlMsgId>{tx_id}</OrgnlMsgId><TxSts>{tx_status}</TxSts>{reason_xml}</TxInfAndSts></FIToFIPmtStsRpt></Document>",
-            tx_id = ctx.transaction_id(),
         )
     }
 }
@@ -96,5 +99,21 @@ mod tests {
             .get::<String>("response.xml")
             .expect("response should be present");
         assert!(response.contains("<TxSts>ACTC</TxSts>"));
+    }
+
+    #[tokio::test]
+    async fn writes_abort_status_to_context() {
+        let mut ctx = context("<Document/>");
+        let participant = StatusResponseBuilder::new(true);
+        participant
+            .abort(&mut ctx)
+            .await
+            .expect("abort should succeed");
+
+        let response = ctx
+            .get::<String>("response.xml")
+            .expect("response should be present");
+        assert!(response.contains("<TxSts>RJCT</TxSts>"));
+        assert!(response.contains("PROCESSING_ABORTED"));
     }
 }

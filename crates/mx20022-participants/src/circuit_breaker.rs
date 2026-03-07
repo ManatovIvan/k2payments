@@ -1,7 +1,7 @@
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use tokio::sync::Mutex;
 
 use mx20022_runtime_core::{
     context::Context,
@@ -41,10 +41,7 @@ impl Participant for CircuitBreaker {
 
     async fn prepare(&self, ctx: &mut Context) -> Result<Action, ParticipantError> {
         let now = Instant::now();
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| ParticipantError::new("circuit-breaker: lock poisoned"))?;
+        let mut state = self.state.lock().await;
         if let Some(until) = state.open_until {
             if now < until {
                 ctx.put_with_writer("circuit_breaker.open", self.name(), true);
@@ -57,20 +54,14 @@ impl Participant for CircuitBreaker {
     }
 
     async fn commit(&self, _ctx: &mut Context) -> Result<(), ParticipantError> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| ParticipantError::new("circuit-breaker: lock poisoned"))?;
+        let mut state = self.state.lock().await;
         state.consecutive_failures = 0;
         state.open_until = None;
         Ok(())
     }
 
     async fn abort(&self, _ctx: &mut Context) -> Result<(), ParticipantError> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| ParticipantError::new("circuit-breaker: lock poisoned"))?;
+        let mut state = self.state.lock().await;
         state.consecutive_failures += 1;
         if state.consecutive_failures >= self.failure_threshold {
             state.open_until = Some(Instant::now() + self.open_duration);
@@ -116,6 +107,25 @@ mod tests {
         assert_eq!(
             participant.prepare(&mut third).await.expect("prepare"),
             Action::Aborted
+        );
+    }
+
+    #[tokio::test]
+    async fn recovers_after_open_duration_expires() {
+        let participant = CircuitBreaker::new(1, Duration::from_millis(10));
+        let mut first = context("TX-1");
+        let mut second = context("TX-2");
+
+        participant.abort(&mut first).await.expect("abort");
+        assert_eq!(
+            participant.prepare(&mut second).await.expect("prepare"),
+            Action::Aborted
+        );
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            participant.prepare(&mut second).await.expect("prepare"),
+            Action::Prepared
         );
     }
 }

@@ -2,12 +2,20 @@ use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
+use hkdf::Hkdf;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 
-#[derive(Debug, Clone)]
 pub struct CryptoService {
     key_bytes: [u8; 32],
+}
+
+impl std::fmt::Debug for CryptoService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CryptoService")
+            .field("key_bytes", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl CryptoService {
@@ -18,13 +26,12 @@ impl CryptoService {
             ));
         }
 
-        // Derive a fixed-length key for AES-256 from any operator-provided secret.
-        let mut hasher = Sha256::new();
-        hasher.update(master_key.as_bytes());
-        let digest = hasher.finalize();
-
+        // Derive a fixed-length key for AES-256 using HKDF-SHA256.
+        let kdf_salt = Sha256::digest(master_key.as_bytes());
+        let hk = Hkdf::<Sha256>::new(Some(kdf_salt.as_slice()), master_key.as_bytes());
         let mut key_bytes = [0_u8; 32];
-        key_bytes.copy_from_slice(&digest[..32]);
+        hk.expand(b"aes-256-gcm-key", &mut key_bytes)
+            .map_err(|e| CryptoError::InvalidMasterKey(format!("HKDF expand failed: {e}")))?;
 
         Ok(Self { key_bytes })
     }
@@ -79,6 +86,12 @@ impl CryptoService {
     }
 }
 
+impl Drop for CryptoService {
+    fn drop(&mut self) {
+        self.key_bytes.fill(0);
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EncryptedBlob {
     pub algorithm: String,
@@ -100,7 +113,7 @@ pub enum CryptoError {
 
 #[cfg(test)]
 mod tests {
-    use crate::CryptoService;
+    use crate::{CryptoService, EncryptedBlob};
 
     #[test]
     fn encrypt_decrypt_roundtrip() {
@@ -111,5 +124,41 @@ mod tests {
         let roundtrip = crypto.decrypt(&blob).expect("decrypt should work");
 
         assert_eq!(roundtrip, plaintext);
+    }
+
+    #[test]
+    fn rejects_empty_master_key() {
+        let result = CryptoService::from_master_key("   ");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn decrypt_fails_with_wrong_key() {
+        let crypto_a = CryptoService::from_master_key("master-key-a").expect("crypto A");
+        let crypto_b = CryptoService::from_master_key("master-key-b").expect("crypto B");
+        let blob = crypto_a.encrypt(b"secret").expect("encrypt");
+        let result = crypto_b.decrypt(&blob);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn decrypt_rejects_unsupported_algorithm() {
+        let crypto = CryptoService::from_master_key("test-master-key").expect("crypto");
+        let blob = EncryptedBlob {
+            algorithm: "AES-128-GCM".to_string(),
+            nonce_b64: "AAAAAAAAAAAAAAAA".to_string(),
+            ciphertext_b64: "AAAA".to_string(),
+        };
+        let result = crypto.decrypt(&blob);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn decrypt_rejects_tampered_ciphertext() {
+        let crypto = CryptoService::from_master_key("test-master-key").expect("crypto");
+        let mut blob = crypto.encrypt(b"secret").expect("encrypt");
+        blob.ciphertext_b64.push('A');
+        let result = crypto.decrypt(&blob);
+        assert!(result.is_err());
     }
 }

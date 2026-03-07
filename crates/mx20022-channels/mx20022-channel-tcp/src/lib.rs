@@ -24,6 +24,7 @@ pub struct TcpInboundConfig {
     pub bind: String,
     pub framing: TcpFraming,
     pub content_type: String,
+    pub auth_token: Option<String>,
 }
 
 #[derive(Clone)]
@@ -68,8 +69,10 @@ impl InboundChannel for TcpInboundChannel {
             let sender = sender.clone();
             let framing = self.config.framing;
             let content_type = self.config.content_type.clone();
+            let auth_token = self.config.auth_token.clone();
             tokio::spawn(async move {
-                if let Err(error) = process_connection(stream, framing, content_type, sender).await
+                if let Err(error) =
+                    process_connection(stream, framing, content_type, auth_token, sender).await
                 {
                     tracing::warn!(error = %error, "tcp inbound connection failed");
                 }
@@ -174,16 +177,24 @@ async fn process_connection(
     stream: TcpStream,
     framing: TcpFraming,
     content_type: String,
+    auth_token: Option<String>,
     sender: mpsc::Sender<InboundMessage>,
 ) -> Result<(), ChannelError> {
     match framing {
         TcpFraming::LengthPrefixed => {
             let mut stream = stream;
+            if let Some(expected) = auth_token.as_deref() {
+                let auth_frame = read_length_prefixed(&mut stream).await?;
+                let presented = decode_utf8_payload(&auth_frame)?;
+                if presented.trim() != expected {
+                    return Err(ChannelError::new("tcp auth failed"));
+                }
+            }
             loop {
                 let frame = read_length_prefixed(&mut stream).await?;
                 sender
                     .send(InboundMessage {
-                        raw: String::from_utf8_lossy(&frame).to_string(),
+                        raw: decode_utf8_payload(&frame)?,
                         content_type: content_type.clone(),
                     })
                     .await
@@ -192,14 +203,38 @@ async fn process_connection(
         }
         TcpFraming::Delimiter(delimiter) => {
             let mut reader = BufReader::new(stream);
+            if let Some(expected) = auth_token.as_deref() {
+                let mut auth_buf = Vec::new();
+                let bytes = (&mut reader)
+                    .take(MAX_FRAME_SIZE as u64 + 1)
+                    .read_until(delimiter, &mut auth_buf)
+                    .await
+                    .map_err(|e| ChannelError::new(format!("tcp read_until failed: {e}")))?;
+                if bytes == 0 {
+                    return Err(ChannelError::new("tcp auth failed"));
+                }
+                if auth_buf.last().copied() == Some(delimiter) {
+                    let _ = auth_buf.pop();
+                }
+                let presented = decode_utf8_payload(&auth_buf)?;
+                if presented.trim() != expected {
+                    return Err(ChannelError::new("tcp auth failed"));
+                }
+            }
             loop {
                 let mut buf = Vec::new();
-                let bytes = reader
+                let bytes = (&mut reader)
+                    .take(MAX_FRAME_SIZE as u64 + 1)
                     .read_until(delimiter, &mut buf)
                     .await
                     .map_err(|e| ChannelError::new(format!("tcp read_until failed: {e}")))?;
                 if bytes == 0 {
                     return Ok(());
+                }
+                if buf.last().copied() != Some(delimiter) && buf.len() > MAX_FRAME_SIZE {
+                    return Err(ChannelError::new(format!(
+                        "tcp delimited frame too large: exceeds {MAX_FRAME_SIZE} byte limit without delimiter"
+                    )));
                 }
 
                 if buf.last().copied() == Some(delimiter) {
@@ -207,7 +242,7 @@ async fn process_connection(
                 }
                 sender
                     .send(InboundMessage {
-                        raw: String::from_utf8_lossy(&buf).to_string(),
+                        raw: decode_utf8_payload(&buf)?,
                         content_type: content_type.clone(),
                     })
                     .await
@@ -215,6 +250,13 @@ async fn process_connection(
             }
         }
     }
+}
+
+const MAX_FRAME_SIZE: usize = 10 * 1024 * 1024;
+
+fn decode_utf8_payload(payload: &[u8]) -> Result<String, ChannelError> {
+    String::from_utf8(payload.to_vec())
+        .map_err(|_| ChannelError::new("tcp payload is not valid UTF-8"))
 }
 
 async fn read_length_prefixed(stream: &mut TcpStream) -> Result<Vec<u8>, ChannelError> {
@@ -226,6 +268,11 @@ async fn read_length_prefixed(stream: &mut TcpStream) -> Result<Vec<u8>, Channel
     let len = u32::from_be_bytes(header) as usize;
     if len == 0 {
         return Err(ChannelError::new("invalid zero-length tcp frame"));
+    }
+    if len > MAX_FRAME_SIZE {
+        return Err(ChannelError::new(format!(
+            "tcp frame too large: {len} bytes exceeds {MAX_FRAME_SIZE} byte limit"
+        )));
     }
 
     let mut payload = vec![0_u8; len];
@@ -297,6 +344,7 @@ mod tests {
             bind: format!("127.0.0.1:{port}"),
             framing: TcpFraming::LengthPrefixed,
             content_type: "application/xml".to_string(),
+            auth_token: None,
         });
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let runner = inbound.clone();

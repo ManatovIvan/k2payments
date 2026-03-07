@@ -38,7 +38,7 @@ impl Participant for AcknowledgementBuilder {
 
         let ack = format!(
             "<AppHdr><BizMsgIdr>{}</BizMsgIdr><MsgDefIdr>head.001.001.04</MsgDefIdr><BizSvc>ACK</BizSvc></AppHdr>",
-            ctx.transaction_id()
+            crate::escape_xml(ctx.transaction_id())
         );
         ctx.put_with_writer("response.xml", self.name(), ack);
         ctx.put_with_writer("response.message_type", self.name(), "head.001".to_string());
@@ -78,5 +78,22 @@ mod tests {
             .get::<String>("response.xml")
             .expect("response should exist");
         assert!(response.contains("<BizSvc>ACK</BizSvc>"));
+    }
+
+    #[tokio::test]
+    async fn overwrite_existing_replaces_response_payload() {
+        let mut ctx = context();
+        ctx.put_with_writer("response.xml", "test", "<old/>".to_string());
+        let participant = AcknowledgementBuilder::new(true);
+        participant
+            .commit(&mut ctx)
+            .await
+            .expect("commit should succeed");
+
+        let response = ctx
+            .get::<String>("response.xml")
+            .expect("response should exist");
+        assert!(response.contains("<BizSvc>ACK</BizSvc>"));
+        assert!(!response.contains("<old/>"));
     }
 }

@@ -177,7 +177,8 @@ mod tests {
 
     #[tokio::test]
     async fn register_match_and_timeout() {
-        let store: Arc<dyn Store> = Arc::new(SqliteStore::new("sqlite::memory:"));
+        let store: Arc<dyn Store> =
+            Arc::new(SqliteStore::new("sqlite::memory:").expect("sqlite store should initialize"));
         let engine = CorrelationEngine::new(store)
             .await
             .expect("engine should build");

@@ -33,3 +33,51 @@ impl TransactionUseCase {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::time::SystemTime;
+
+    use mx20022_runtime_core::transaction_manager::Outcome as RuntimeOutcome;
+    use mx20022_store::Outcome as StoreOutcome;
+
+    use super::TransactionUseCase;
+    use crate::domain::TransactionRequest;
+
+    #[test]
+    fn begin_record_maps_request_fields() {
+        let request = TransactionRequest {
+            tx_id: "TX-1".to_string(),
+            pipeline: "demo".to_string(),
+            source_channel: "http-in".to_string(),
+            message_type: "pacs.008".to_string(),
+            raw_message: "<Document/>".to_string(),
+            key_fields: HashMap::new(),
+        };
+        let now = SystemTime::now();
+        let record = TransactionUseCase::begin_record(&request, now);
+
+        assert_eq!(record.tx_id, "TX-1");
+        assert_eq!(record.pipeline, "demo");
+        assert_eq!(record.state, "RECEIVED");
+        assert_eq!(record.received_at, now);
+        assert!(record.completed_at.is_none());
+    }
+
+    #[test]
+    fn map_outcome_covers_all_variants() {
+        assert_eq!(
+            TransactionUseCase::map_outcome(RuntimeOutcome::Committed),
+            StoreOutcome::Committed
+        );
+        assert_eq!(
+            TransactionUseCase::map_outcome(RuntimeOutcome::Aborted),
+            StoreOutcome::Aborted
+        );
+        assert_eq!(
+            TransactionUseCase::map_outcome(RuntimeOutcome::Poison),
+            StoreOutcome::Poison
+        );
+    }
+}

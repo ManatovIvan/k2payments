@@ -1,3 +1,17 @@
+[advisories]
+ignore = [
+  { id = "RUSTSEC-2024-0384", reason = "Transitive via lapin; no safe upgrade available yet" },
+  { id = "RUSTSEC-2025-0134", reason = "Transitive via async-nats/tonic stack; awaiting upstream migration" },
+]
+
 [licenses]
-unlicensed = "deny"
-allow = ["Apache-2.0", "MIT", "BSD-3-Clause", "ISC"]
+allow = ["Apache-2.0", "MIT", "BSD-3-Clause", "BSD-2-Clause", "ISC", "Unicode-3.0", "Unicode-DFS-2016", "OpenSSL", "Zlib", "CDLA-Permissive-2.0"]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

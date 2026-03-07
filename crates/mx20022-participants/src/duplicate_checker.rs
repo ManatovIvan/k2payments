@@ -142,7 +142,8 @@ mod tests {
 
     #[tokio::test]
     async fn aborts_when_duplicate_message_id_exists() {
-        let store: Arc<dyn Store> = Arc::new(SqliteStore::new("sqlite::memory:"));
+        let store: Arc<dyn Store> =
+            Arc::new(SqliteStore::new("sqlite::memory:").expect("sqlite store should initialize"));
         let mut keys = HashMap::new();
         keys.insert("message_id".to_string(), "MSG-1".to_string());
         store
@@ -175,7 +176,8 @@ mod tests {
 
     #[tokio::test]
     async fn prepares_when_no_duplicate_found() {
-        let store: Arc<dyn Store> = Arc::new(SqliteStore::new("sqlite::memory:"));
+        let store: Arc<dyn Store> =
+            Arc::new(SqliteStore::new("sqlite::memory:").expect("sqlite store should initialize"));
         let participant = DuplicateChecker::new(store);
         let mut ctx = context(
             "TX-NEW",
@@ -187,5 +189,78 @@ mod tests {
             .await
             .expect("prepare should return");
         assert_eq!(action, Action::Prepared);
+    }
+
+    #[tokio::test]
+    async fn prepares_when_message_has_no_duplicate_keys() {
+        let store: Arc<dyn Store> =
+            Arc::new(SqliteStore::new("sqlite::memory:").expect("sqlite store should initialize"));
+        let participant = DuplicateChecker::new(store);
+        let mut ctx = context("TX-NEW", "<Document><Any>value</Any></Document>");
+
+        let action = participant
+            .prepare(&mut ctx)
+            .await
+            .expect("prepare should return");
+        assert_eq!(action, Action::Prepared);
+    }
+
+    #[tokio::test]
+    async fn marks_first_matching_duplicate_key() {
+        let store: Arc<dyn Store> =
+            Arc::new(SqliteStore::new("sqlite::memory:").expect("sqlite store should initialize"));
+        let mut msg_keys = HashMap::new();
+        msg_keys.insert("message_id".to_string(), "MSG-1".to_string());
+        let mut uetr_keys = HashMap::new();
+        uetr_keys.insert(
+            "uetr".to_string(),
+            "97ed4827-7b6f-4491-a06f-b548d5a7512d".to_string(),
+        );
+
+        store
+            .begin_transaction(&TransactionRecord {
+                tx_id: "TX-MSG".to_string(),
+                pipeline: "p".to_string(),
+                source_channel: "c".to_string(),
+                message_type: "pacs.008".to_string(),
+                raw_message: "<Document/>".to_string(),
+                state: "COMMITTED".to_string(),
+                received_at: SystemTime::now(),
+                completed_at: Some(SystemTime::now()),
+                key_fields: msg_keys,
+            })
+            .await
+            .expect("seed msg");
+        store
+            .begin_transaction(&TransactionRecord {
+                tx_id: "TX-UETR".to_string(),
+                pipeline: "p".to_string(),
+                source_channel: "c".to_string(),
+                message_type: "pacs.008".to_string(),
+                raw_message: "<Document/>".to_string(),
+                state: "COMMITTED".to_string(),
+                received_at: SystemTime::now(),
+                completed_at: Some(SystemTime::now()),
+                key_fields: uetr_keys,
+            })
+            .await
+            .expect("seed uetr");
+
+        let participant = DuplicateChecker::new(store).with_keys(vec![
+            DuplicateKey::MessageId,
+            DuplicateKey::EndToEndId,
+            DuplicateKey::Uetr,
+        ]);
+        let mut ctx = context(
+            "TX-NEW",
+            xml("MSG-1", "E2E-1", "97ed4827-7b6f-4491-a06f-b548d5a7512d").as_str(),
+        );
+
+        let action = participant.prepare(&mut ctx).await.expect("prepare");
+        assert_eq!(action, Action::Aborted);
+        let key = ctx
+            .get::<String>("duplicate.key")
+            .expect("duplicate key should be recorded");
+        assert_eq!(key, "message_id");
     }
 }

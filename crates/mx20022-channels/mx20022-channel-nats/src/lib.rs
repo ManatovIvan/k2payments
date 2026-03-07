@@ -73,7 +73,8 @@ impl InboundChannel for NatsInboundChannel {
 
             sender
                 .send(InboundMessage {
-                    raw: String::from_utf8_lossy(&message.payload).to_string(),
+                    raw: String::from_utf8(message.payload.to_vec())
+                        .map_err(|_| ChannelError::new("nats payload is not valid UTF-8"))?,
                     content_type: self.config.content_type.clone(),
                 })
                 .await

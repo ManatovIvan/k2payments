@@ -1,7 +1,6 @@
 /// Missing high-value tests for mx20022-store-sqlite.
 ///
-/// This file is NOT wired into the build yet — add `mod tests_missing;` to lib.rs
-/// (gated behind `#[cfg(test)]`) once you are ready to run these.
+/// This module is wired from `lib.rs` via `mod tests_missing;`.
 ///
 /// Every test uses the in-memory SQLite store, so there are no external deps.
 #[cfg(test)]
@@ -52,7 +51,7 @@ mod tests {
     // ===========================================================================
     #[tokio::test]
     async fn find_by_message_id_returns_matching_records() {
-        let store = SqliteStore::new("sqlite::memory:");
+        let store = SqliteStore::new("sqlite::memory:").expect("sqlite store should initialize");
 
         store
             .begin_transaction(&record_with_keys("TX-A", "MSG-001", "E2E-001", "UETR-001"))
@@ -76,7 +75,7 @@ mod tests {
 
     #[tokio::test]
     async fn find_by_uetr_returns_matching_record() {
-        let store = SqliteStore::new("sqlite::memory:");
+        let store = SqliteStore::new("sqlite::memory:").expect("sqlite store should initialize");
 
         store
             .begin_transaction(&record_with_keys("TX-C", "MSG-003", "E2E-003", "UETR-ABC"))
@@ -90,7 +89,7 @@ mod tests {
 
     #[tokio::test]
     async fn find_by_end_to_end_id_returns_matching_record() {
-        let store = SqliteStore::new("sqlite::memory:");
+        let store = SqliteStore::new("sqlite::memory:").expect("sqlite store should initialize");
 
         store
             .begin_transaction(&record_with_keys("TX-D", "MSG-004", "E2E-XYZ", "UETR-004"))
@@ -112,7 +111,7 @@ mod tests {
     // ===========================================================================
     #[tokio::test]
     async fn complete_transaction_persists_all_outcome_variants() {
-        let store = SqliteStore::new("sqlite::memory:");
+        let store = SqliteStore::new("sqlite::memory:").expect("sqlite store should initialize");
 
         for (tx_id, outcome, expected_state) in [
             ("TX-COMMIT", Outcome::Committed, "COMMITTED"),
@@ -157,7 +156,7 @@ mod tests {
     // ===========================================================================
     #[tokio::test]
     async fn replay_dead_letter_errors_for_unknown_id() {
-        let store = SqliteStore::new("sqlite::memory:");
+        let store = SqliteStore::new("sqlite::memory:").expect("sqlite store should initialize");
 
         let result = store.replay_dead_letter("NO-SUCH-ID").await;
         assert!(
@@ -182,7 +181,7 @@ mod tests {
     #[tokio::test]
     async fn list_dead_letters_filters_by_pipeline_and_respects_limit() {
         use mx20022_store::DeadLetter;
-        let store = SqliteStore::new("sqlite::memory:");
+        let store = SqliteStore::new("sqlite::memory:").expect("sqlite store should initialize");
 
         // Insert three transactions, two on the demo pipeline.
         let mut rec_demo = record_with_keys("TX-DL-1", "M1", "E1", "U1");
@@ -245,7 +244,7 @@ mod tests {
     #[tokio::test]
     async fn update_transaction_errors_when_record_does_not_exist() {
         use mx20022_store::TransactionUpdate;
-        let store = SqliteStore::new("sqlite::memory:");
+        let store = SqliteStore::new("sqlite::memory:").expect("sqlite store should initialize");
 
         let result = store
             .update_transaction(

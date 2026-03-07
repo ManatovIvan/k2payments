@@ -18,10 +18,12 @@ pub enum AuthMode {
     JwtHs256,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AuthConfig {
     pub mode: AuthMode,
     pub jwt_hs256_secret: Option<String>,
+    pub legacy_bearer_token: Option<String>,
+    pub legacy_readonly_token: Option<String>,
     pub jwt_issuer: Option<String>,
     pub jwt_audience: Option<String>,
     pub ready_roles: Vec<String>,
@@ -33,11 +35,45 @@ pub struct AuthConfig {
     pub mtls_allowed_subjects: Vec<String>,
 }
 
+impl std::fmt::Debug for AuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthConfig")
+            .field("mode", &self.mode)
+            .field(
+                "jwt_hs256_secret",
+                &self.jwt_hs256_secret.as_ref().map(|_| "***redacted***"),
+            )
+            .field(
+                "legacy_bearer_token",
+                &self.legacy_bearer_token.as_ref().map(|_| "***redacted***"),
+            )
+            .field(
+                "legacy_readonly_token",
+                &self
+                    .legacy_readonly_token
+                    .as_ref()
+                    .map(|_| "***redacted***"),
+            )
+            .field("jwt_issuer", &self.jwt_issuer)
+            .field("jwt_audience", &self.jwt_audience)
+            .field("ready_roles", &self.ready_roles)
+            .field("status_roles", &self.status_roles)
+            .field("tx_roles", &self.tx_roles)
+            .field("reload_roles", &self.reload_roles)
+            .field("require_mtls_subject", &self.require_mtls_subject)
+            .field("mtls_subject_header", &self.mtls_subject_header)
+            .field("mtls_allowed_subjects", &self.mtls_allowed_subjects)
+            .finish()
+    }
+}
+
 impl Default for AuthConfig {
     fn default() -> Self {
         Self {
-            mode: AuthMode::LegacyBearer,
+            mode: AuthMode::Disabled,
             jwt_hs256_secret: None,
+            legacy_bearer_token: None,
+            legacy_readonly_token: None,
             jwt_issuer: None,
             jwt_audience: None,
             ready_roles: Vec::new(),
@@ -85,19 +121,48 @@ pub fn authorize_request(
 
     match config.mode {
         AuthMode::Disabled => Ok(()),
-        AuthMode::LegacyBearer => authorize_legacy(resource, bearer_header),
+        AuthMode::LegacyBearer => authorize_legacy(config, resource, bearer_header),
         AuthMode::JwtHs256 => authorize_jwt(config, resource, bearer_header),
     }
 }
 
-fn authorize_legacy(resource: AdminResource, bearer_header: Option<&str>) -> Result<(), AuthError> {
+fn authorize_legacy(
+    config: &AuthConfig,
+    resource: AdminResource,
+    bearer_header: Option<&str>,
+) -> Result<(), AuthError> {
     let token = parse_bearer_token(bearer_header).ok_or(AuthError::MissingBearer)?;
-    if (resource == AdminResource::Transaction || resource == AdminResource::Reload)
-        && token == "readonly"
-    {
-        return Err(AuthError::Forbidden);
+    if token.trim().is_empty() {
+        return Err(AuthError::InvalidBearer);
     }
-    Ok(())
+    let admin_token = config
+        .legacy_bearer_token
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(ToString::to_string);
+    let readonly_token = config
+        .legacy_readonly_token
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(ToString::to_string);
+
+    if let Some(expected_admin) = admin_token.as_deref() {
+        if token == expected_admin {
+            return Ok(());
+        }
+    } else {
+        return Err(AuthError::InvalidBearer);
+    }
+
+    if matches!(resource, AdminResource::Ready | AdminResource::Status)
+        && readonly_token
+            .as_deref()
+            .is_some_and(|expected| token == expected)
+    {
+        return Ok(());
+    }
+
+    Err(AuthError::Forbidden)
 }
 
 fn authorize_jwt(
@@ -289,5 +354,50 @@ mod tests {
         let accepted =
             authorize_request(&cfg, AdminResource::Ready, None, Some("CN=trusted-client"));
         assert!(accepted.is_ok());
+    }
+
+    #[test]
+    fn legacy_mode_requires_explicit_token_configuration() {
+        let cfg = AuthConfig {
+            mode: AuthMode::LegacyBearer,
+            ..AuthConfig::default()
+        };
+
+        let denied = authorize_request(&cfg, AdminResource::Ready, Some("Bearer anything"), None);
+        assert!(matches!(denied, Err(AuthError::InvalidBearer)));
+    }
+
+    #[test]
+    fn legacy_mode_readonly_token_cannot_access_write_paths() {
+        let cfg = AuthConfig {
+            mode: AuthMode::LegacyBearer,
+            legacy_bearer_token: Some("admin-token".to_string()),
+            legacy_readonly_token: Some("readonly-token".to_string()),
+            ..AuthConfig::default()
+        };
+
+        let readonly_status = authorize_request(
+            &cfg,
+            AdminResource::Status,
+            Some("Bearer readonly-token"),
+            None,
+        );
+        assert!(readonly_status.is_ok());
+
+        let readonly_reload = authorize_request(
+            &cfg,
+            AdminResource::Reload,
+            Some("Bearer readonly-token"),
+            None,
+        );
+        assert!(matches!(readonly_reload, Err(AuthError::Forbidden)));
+
+        let admin_reload = authorize_request(
+            &cfg,
+            AdminResource::Reload,
+            Some("Bearer admin-token"),
+            None,
+        );
+        assert!(admin_reload.is_ok());
     }
 }

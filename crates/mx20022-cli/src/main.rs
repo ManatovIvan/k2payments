@@ -63,21 +63,22 @@ async fn db_command(args: &[String]) -> Result<(), CliError> {
     let config = mx20022_config::RuntimeConfig::load_from_path(config_path)?;
     match config.store.backend.as_str() {
         "sqlite" => {
-            let store = SqliteStore::new(config.store.url.clone());
+            let store =
+                SqliteStore::with_pool_size(config.store.url.clone(), config.store.pool_size)?;
             match action.as_str() {
                 "migrate" => {
                     store.apply_migrations().await?;
-                    println!("migrations applied to {}", store.database_url());
+                    println!("migrations applied to sqlite backend");
                     Ok(())
                 }
                 "rollback" => {
                     store.rollback_migrations().await?;
-                    println!("migrations rolled back for {}", store.database_url());
+                    println!("migrations rolled back for sqlite backend");
                     Ok(())
                 }
                 "seed" => {
                     store.apply_dev_seed().await?;
-                    println!("dev seed applied to {}", store.database_url());
+                    println!("dev seed applied to sqlite backend");
                     Ok(())
                 }
                 _ => Err(CliError::Usage(
@@ -86,21 +87,25 @@ async fn db_command(args: &[String]) -> Result<(), CliError> {
             }
         }
         "postgres" => {
-            let store = PostgresStore::connect(config.store.url.clone()).await?;
+            let store = PostgresStore::connect_with_pool_size(
+                config.store.url.clone(),
+                config.store.pool_size,
+            )
+            .await?;
             match action.as_str() {
                 "migrate" => {
                     store.apply_migrations().await?;
-                    println!("migrations applied to {}", store.database_url());
+                    println!("migrations applied to postgres backend");
                     Ok(())
                 }
                 "rollback" => {
                     store.rollback_migrations().await?;
-                    println!("migrations rolled back for {}", store.database_url());
+                    println!("migrations rolled back for postgres backend");
                     Ok(())
                 }
                 "seed" => {
                     store.apply_dev_seed().await?;
-                    println!("dev seed applied to {}", store.database_url());
+                    println!("dev seed applied to postgres backend");
                     Ok(())
                 }
                 _ => Err(CliError::Usage(
@@ -160,8 +165,11 @@ async fn status_command(args: &[String]) -> Result<(), CliError> {
 
     let admin_url =
         option_value(args, "--admin").unwrap_or_else(|| "http://127.0.0.1:9090".to_string());
-    let token = option_value(args, "--token")
-        .unwrap_or_else(|| env::var("MXCTL_TOKEN").unwrap_or_else(|_| "readonly".to_string()));
+    let token = resolve_admin_token(args, "--token").ok_or_else(|| {
+        CliError::Usage(
+            "admin token is required; pass --token <token> or set MXCTL_TOKEN".to_string(),
+        )
+    })?;
 
     let url = format!("{}/status", admin_url.trim_end_matches('/'));
     let response = reqwest::Client::new()
@@ -255,8 +263,11 @@ async fn reload_command(args: &[String]) -> Result<(), CliError> {
 
     let admin_url =
         option_value(args, "--admin").unwrap_or_else(|| "http://127.0.0.1:9090".to_string());
-    let token = option_value(args, "--token")
-        .unwrap_or_else(|| env::var("MXCTL_TOKEN").unwrap_or_else(|_| "admin".to_string()));
+    let token = resolve_admin_token(args, "--token").ok_or_else(|| {
+        CliError::Usage(
+            "admin token is required; pass --token <token> or set MXCTL_TOKEN".to_string(),
+        )
+    })?;
 
     let url = format!("{}/reload", admin_url.trim_end_matches('/'));
     let response = reqwest::Client::new()
@@ -329,8 +340,11 @@ async fn channel_list_command(args: &[String]) -> Result<(), CliError> {
 
     let admin_url =
         option_value(args, "--admin").unwrap_or_else(|| "http://127.0.0.1:9090".to_string());
-    let token = option_value(args, "--token")
-        .unwrap_or_else(|| env::var("MXCTL_TOKEN").unwrap_or_else(|_| "readonly".to_string()));
+    let token = resolve_admin_token(args, "--token").ok_or_else(|| {
+        CliError::Usage(
+            "admin token is required; pass --token <token> or set MXCTL_TOKEN".to_string(),
+        )
+    })?;
     let url = format!("{}/status", admin_url.trim_end_matches('/'));
     let response = reqwest::Client::new()
         .get(&url)
@@ -384,15 +398,18 @@ async fn tx_command(args: &[String]) -> Result<(), CliError> {
             let config = mx20022_config::RuntimeConfig::load_from_path(config_path)?;
             let tx = match config.store.backend.as_str() {
                 "sqlite" => {
-                    SqliteStore::new(config.store.url.clone())
+                    SqliteStore::with_pool_size(config.store.url.clone(), config.store.pool_size)?
                         .find_by_id(tx_id)
                         .await?
                 }
                 "postgres" => {
-                    PostgresStore::connect(config.store.url.clone())
-                        .await?
-                        .find_by_id(tx_id)
-                        .await?
+                    PostgresStore::connect_with_pool_size(
+                        config.store.url.clone(),
+                        config.store.pool_size,
+                    )
+                    .await?
+                    .find_by_id(tx_id)
+                    .await?
                 }
                 "rocksdb" => {
                     RocksDbStore::open(config.store.url.clone())?
@@ -420,15 +437,18 @@ async fn tx_command(args: &[String]) -> Result<(), CliError> {
             let config = mx20022_config::RuntimeConfig::load_from_path(config_path)?;
             let entries = match config.store.backend.as_str() {
                 "sqlite" => {
-                    SqliteStore::new(config.store.url.clone())
+                    SqliteStore::with_pool_size(config.store.url.clone(), config.store.pool_size)?
                         .list_context_entries(tx_id)
                         .await?
                 }
                 "postgres" => {
-                    PostgresStore::connect(config.store.url.clone())
-                        .await?
-                        .list_context_entries(tx_id)
-                        .await?
+                    PostgresStore::connect_with_pool_size(
+                        config.store.url.clone(),
+                        config.store.pool_size,
+                    )
+                    .await?
+                    .list_context_entries(tx_id)
+                    .await?
                 }
                 "rocksdb" => {
                     RocksDbStore::open(config.store.url.clone())?
@@ -474,13 +494,18 @@ async fn tx_search_command(args: &[String]) -> Result<(), CliError> {
 
     match config.store.backend.as_str() {
         "sqlite" => {
-            let store = SqliteStore::new(config.store.url.clone());
+            let store =
+                SqliteStore::with_pool_size(config.store.url.clone(), config.store.pool_size)?;
             let records = search_records(&store, args).await?;
             print_transactions(&records);
             Ok(())
         }
         "postgres" => {
-            let store = PostgresStore::connect(config.store.url.clone()).await?;
+            let store = PostgresStore::connect_with_pool_size(
+                config.store.url.clone(),
+                config.store.pool_size,
+            )
+            .await?;
             let records = search_records(&store, args).await?;
             print_transactions(&records);
             Ok(())
@@ -578,6 +603,12 @@ fn option_value(args: &[String], flag: &str) -> Option<String> {
     })
 }
 
+fn resolve_admin_token(args: &[String], flag: &str) -> Option<String> {
+    option_value(args, flag)
+        .or_else(|| env::var("MXCTL_TOKEN").ok())
+        .filter(|value| !value.trim().is_empty())
+}
+
 fn tx_search_usage() -> String {
     "usage: mxctl tx search --config <path> [--msg-id <id>|--e2e-id <id>|--uetr <id>|--pipeline <name> --message-type <type> --state <state> --since <epoch_ms> --until <epoch_ms> --limit <n>]".to_string()
 }
@@ -592,11 +623,16 @@ async fn deadletter_command(args: &[String]) -> Result<(), CliError> {
 
     match config.store.backend.as_str() {
         "sqlite" => {
-            let store = SqliteStore::new(config.store.url.clone());
+            let store =
+                SqliteStore::with_pool_size(config.store.url.clone(), config.store.pool_size)?;
             run_deadletter_action(&store, action, args).await
         }
         "postgres" => {
-            let store = PostgresStore::connect(config.store.url.clone()).await?;
+            let store = PostgresStore::connect_with_pool_size(
+                config.store.url.clone(),
+                config.store.pool_size,
+            )
+            .await?;
             run_deadletter_action(&store, action, args).await
         }
         "rocksdb" => {

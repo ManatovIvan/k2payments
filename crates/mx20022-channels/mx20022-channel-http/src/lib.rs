@@ -3,7 +3,12 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use axum::body::Bytes;
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::header::{
+    CONTENT_SECURITY_POLICY, REFERRER_POLICY, STRICT_TRANSPORT_SECURITY, X_CONTENT_TYPE_OPTIONS,
+    X_FRAME_OPTIONS,
+};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
+use axum::middleware::map_response;
 use axum::routing::post;
 use axum::Router;
 use mx20022_channels::auth::{authorize_inbound, InboundAuthConfig, InboundAuthContext};
@@ -12,6 +17,7 @@ use mx20022_channels::{
     OutboundMessage,
 };
 use tokio::sync::{mpsc, RwLock};
+use tower_http::cors::{Any, CorsLayer};
 
 #[derive(Debug, Clone)]
 pub struct HttpInboundConfig {
@@ -59,6 +65,14 @@ impl InboundChannel for HttpInboundChannel {
 
         let app = Router::new()
             .route("/", post(handle_post))
+            .layer(
+                CorsLayer::new()
+                    .allow_origin(Any)
+                    .allow_methods([Method::POST])
+                    .allow_headers(Any),
+            )
+            .layer(map_response(add_security_headers))
+            .layer(axum::extract::DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
             .with_state(state);
 
         let listener = tokio::net::TcpListener::bind(&self.config.bind)
@@ -122,7 +136,10 @@ async fn handle_post(
         return (code, String::new());
     }
 
-    let payload = String::from_utf8_lossy(&body).to_string();
+    let payload = match String::from_utf8(body.to_vec()) {
+        Ok(payload) => payload,
+        Err(_) => return (StatusCode::BAD_REQUEST, String::new()),
+    };
     let result = state
         .sender
         .send(InboundMessage {
@@ -138,6 +155,28 @@ async fn handle_post(
             (StatusCode::INTERNAL_SERVER_ERROR, String::new())
         }
     }
+}
+
+const MAX_HTTP_BODY_BYTES: usize = 10 * 1024 * 1024;
+
+async fn add_security_headers(mut response: axum::response::Response) -> axum::response::Response {
+    let headers = response.headers_mut();
+    headers.insert(
+        STRICT_TRANSPORT_SECURITY,
+        HeaderValue::from_static("max-age=31536000; includeSubDomains"),
+    );
+    headers.insert(X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    headers.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    headers.insert(REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+    headers.insert(
+        CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("default-src 'none'; frame-ancestors 'none'"),
+    );
+    headers.insert(
+        HeaderName::from_static("permissions-policy"),
+        HeaderValue::from_static("accelerometer=(), camera=(), geolocation=(), microphone=()"),
+    );
+    response
 }
 
 #[derive(Debug, Clone)]

@@ -1,9 +1,9 @@
 use std::sync::Arc;
-use std::sync::RwLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use mx20022_store::{DeadLetterQuery, Store, StoreQuery};
+use mx20022_store::Store;
+use tokio::sync::RwLock;
 
 use crate::controller::{AdminController, AdminControllerError};
 use crate::dto::{
@@ -85,26 +85,16 @@ impl AdminController for StoreBackedAdminController {
             .map_err(|e| AdminControllerError::Internal(e.to_string()))?;
         let pending_correlation_count = self
             .store
-            .load_pending_expectations()
+            .count_pending_expectations()
             .await
-            .map_err(|e| AdminControllerError::Internal(e.to_string()))?
-            .len();
+            .map_err(|e| AdminControllerError::Internal(e.to_string()))?;
         let dead_letter_count = self
             .store
-            .list_dead_letters(DeadLetterQuery {
-                pipeline: None,
-                limit: None,
-            })
+            .count_dead_letters(None)
             .await
-            .map_err(|e| AdminControllerError::Internal(e.to_string()))?
-            .len();
+            .map_err(|e| AdminControllerError::Internal(e.to_string()))?;
         let in_flight_count = in_flight_transaction_count(self.store.as_ref()).await?;
-        let reload_status = self
-            .snapshot
-            .reload_status
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
+        let reload_status = self.snapshot.reload_status.read().await.clone();
 
         Ok(StatusResponseDto {
             runtime: self.snapshot.runtime.clone(),
@@ -179,40 +169,29 @@ async fn in_flight_transaction_count(store: &dyn Store) -> Result<usize, AdminCo
         "COMMITTING",
         "ABORTING",
     ];
-    let mut total = 0usize;
-
-    for state in states {
-        let result = store
-            .query(StoreQuery {
-                pipeline: None,
-                message_type: None,
-                state: Some(state.to_string()),
-                since: None,
-                until: None,
-                limit: None,
-            })
-            .await
-            .map_err(|e| AdminControllerError::Internal(e.to_string()))?;
-        total = total.saturating_add(result.total);
-    }
-    Ok(total)
+    store
+        .count_transactions_by_states(&states)
+        .await
+        .map_err(|e| AdminControllerError::Internal(e.to_string()))
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::sync::{Arc, RwLock};
+    use std::sync::Arc;
     use std::time::SystemTime;
 
     use mx20022_store::{Store, TransactionRecord};
     use mx20022_store_sqlite::SqliteStore;
+    use tokio::sync::RwLock;
 
     use crate::controller::AdminController;
     use crate::service::{ReloadStatus, RuntimeStatusSnapshot, StoreBackedAdminController};
 
     #[tokio::test]
     async fn returns_status_and_transaction_details() {
-        let store: Arc<dyn Store> = Arc::new(SqliteStore::new("sqlite::memory:"));
+        let store: Arc<dyn Store> =
+            Arc::new(SqliteStore::new("sqlite::memory:").expect("sqlite store should initialize"));
 
         store
             .begin_transaction(&TransactionRecord {

@@ -6,6 +6,7 @@ use tonic::{Request, Response, Status};
 
 use crate::auth::{authorize_request, AdminResource, AuthConfig, AuthError};
 use crate::controller::{AdminController, AdminControllerError};
+use crate::tls::TlsConfig;
 
 pub mod proto {
     tonic::include_proto!("mx20022.runtime.admin.v1");
@@ -145,11 +146,37 @@ pub async fn serve(
     controller: Arc<dyn AdminController>,
     auth: AuthConfig,
 ) -> Result<(), GrpcHostError> {
+    serve_with_tls(addr, controller, auth, None).await
+}
+
+pub async fn serve_with_tls(
+    addr: &str,
+    controller: Arc<dyn AdminController>,
+    auth: AuthConfig,
+    tls: Option<TlsConfig>,
+) -> Result<(), GrpcHostError> {
     let socket: SocketAddr = addr
         .parse::<SocketAddr>()
         .map_err(|e| GrpcHostError::Bind(addr.to_string(), e.to_string()))?;
 
-    Server::builder()
+    let mut builder = Server::builder();
+
+    if let Some(tls) = tls {
+        let cert = std::fs::read_to_string(&tls.cert_path)
+            .map_err(|e| GrpcHostError::Tls(format!("failed to read cert: {e}")))?;
+        let key = std::fs::read_to_string(&tls.key_path)
+            .map_err(|e| GrpcHostError::Tls(format!("failed to read key: {e}")))?;
+        let identity = tonic::transport::Identity::from_pem(cert, key);
+        let tls_config = tonic::transport::ServerTlsConfig::new().identity(identity);
+        builder = builder
+            .tls_config(tls_config)
+            .map_err(|e| GrpcHostError::Tls(format!("tls config failed: {e}")))?;
+        tracing::info!(addr = %addr, "admin gRPC host starting with TLS");
+    } else {
+        tracing::warn!("admin gRPC host starting without TLS");
+    }
+
+    builder
         .add_service(proto::admin_service_server::AdminServiceServer::new(
             AdminGrpcService::new(controller, auth),
         ))
@@ -162,7 +189,10 @@ fn map_error_to_status(error: AdminControllerError) -> Status {
     match error {
         AdminControllerError::NotFound => Status::not_found("not found"),
         AdminControllerError::Forbidden => Status::permission_denied("forbidden"),
-        AdminControllerError::Internal(msg) => Status::internal(msg),
+        AdminControllerError::Internal(msg) => {
+            tracing::error!(error = %msg, "admin request failed");
+            Status::internal("internal server error")
+        }
     }
 }
 
@@ -184,16 +214,19 @@ pub enum GrpcHostError {
     Bind(String, String),
     #[error("failed to serve grpc admin host: {0}")]
     Serve(String),
+    #[error("TLS configuration error: {0}")]
+    Tls(String),
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::sync::{Arc, RwLock};
+    use std::sync::Arc;
     use std::time::SystemTime;
 
     use mx20022_store::{Store, TransactionRecord};
     use mx20022_store_sqlite::SqliteStore;
+    use tokio::sync::RwLock;
 
     use crate::controller::AdminController;
     use crate::service::{ReloadStatus, RuntimeStatusSnapshot, StoreBackedAdminController};
@@ -202,7 +235,8 @@ mod tests {
 
     #[tokio::test]
     async fn grpc_service_returns_status_and_tx() {
-        let store: Arc<dyn Store> = Arc::new(SqliteStore::new("sqlite::memory:"));
+        let store: Arc<dyn Store> =
+            Arc::new(SqliteStore::new("sqlite::memory:").expect("sqlite store should initialize"));
         store
             .begin_transaction(&TransactionRecord {
                 tx_id: "TX-GRPC-1".to_string(),

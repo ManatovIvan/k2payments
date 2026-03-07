@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -6,7 +7,8 @@ use mx20022_store::{
     ContextEntry, DeadLetter, DeadLetterQuery, ExpUpdate, Expectation, Outcome, QueryResult, Store,
     StoreError, StoreHealth, StoreQuery, TransactionRecord, TransactionUpdate,
 };
-use sqlx::{Pool, QueryBuilder, Row, Sqlite, SqlitePool};
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use sqlx::{Pool, QueryBuilder, Row, Sqlite};
 use tokio::sync::OnceCell;
 
 #[cfg(test)]
@@ -17,32 +19,34 @@ pub const MIGRATION_0001_DOWN: &str = include_str!("../migrations/0001_initial_s
 pub const DEV_SEED_SQL: &str = include_str!("../seeds/dev_seed.sql");
 
 pub struct SqliteStore {
-    database_url: String,
     pool: Pool<Sqlite>,
     initialized: OnceCell<()>,
 }
 
 impl SqliteStore {
-    pub fn new(database_url: impl Into<String>) -> Self {
-        let database_url = database_url.into();
-        let connect_url = normalize_sqlite_url(&database_url);
-
-        let pool = SqlitePool::connect_lazy(&connect_url).unwrap_or_else(|e| {
-            panic!(
-                "failed to create sqlite lazy pool `{}` from `{}`: {}",
-                connect_url, database_url, e
-            )
-        });
-
-        Self {
-            database_url,
-            pool,
-            initialized: OnceCell::new(),
-        }
+    pub fn new(database_url: impl Into<String>) -> Result<Self, StoreError> {
+        Self::with_pool_size(database_url, None)
     }
 
-    pub fn database_url(&self) -> &str {
-        &self.database_url
+    pub fn with_pool_size(
+        database_url: impl Into<String>,
+        pool_size: Option<u32>,
+    ) -> Result<Self, StoreError> {
+        let database_url = database_url.into();
+        let connect_url = normalize_sqlite_url(&database_url);
+        let connect_options = SqliteConnectOptions::from_str(&connect_url)
+            .map_err(|e| StoreError::new(format!("invalid sqlite url `{database_url}`: {e}")))?
+            .create_if_missing(true);
+        let mut pool_options = SqlitePoolOptions::new();
+        if let Some(size) = pool_size {
+            pool_options = pool_options.max_connections(size.max(1));
+        }
+        let pool = pool_options.connect_lazy_with(connect_options);
+
+        Ok(Self {
+            pool,
+            initialized: OnceCell::new(),
+        })
     }
 
     pub async fn apply_migrations(&self) -> Result<(), StoreError> {
@@ -279,6 +283,31 @@ impl Store for SqliteStore {
         Ok(())
     }
 
+    async fn batch_append_context_entries(
+        &self,
+        tx_id: &str,
+        entries: &[ContextEntry],
+    ) -> Result<(), StoreError> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        self.ensure_initialized().await?;
+        let mut qb = QueryBuilder::<Sqlite>::new(
+            "INSERT INTO context_mutations (tx_id, key, writer, written_at) ",
+        );
+        qb.push_values(entries, |mut b, entry| {
+            b.push_bind(tx_id.to_string())
+                .push_bind(entry.key.clone())
+                .push_bind(entry.writer.clone())
+                .push_bind(encode_time(entry.written_at));
+        });
+        qb.build()
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StoreError::new(format!("batch_append_context_entries failed: {e}")))?;
+        Ok(())
+    }
+
     async fn list_context_entries(&self, tx_id: &str) -> Result<Vec<ContextEntry>, StoreError> {
         self.ensure_initialized().await?;
         let rows = sqlx::query(
@@ -453,27 +482,29 @@ impl Store for SqliteStore {
         Ok(result)
     }
 
+    async fn count_pending_expectations(&self) -> Result<usize, StoreError> {
+        self.ensure_initialized().await?;
+        let row = sqlx::query("SELECT COUNT(*) as total FROM expectations WHERE state = 'PENDING'")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| StoreError::new(format!("count_pending_expectations failed: {e}")))?;
+        let total = row.try_get::<i64, _>("total").map_err(|e| {
+            StoreError::new(format!("count_pending_expectations mapping failed: {e}"))
+        })?;
+        Ok(usize::try_from(total.max(0)).unwrap_or(usize::MAX))
+    }
+
     async fn update_expectation(&self, id: &str, update: ExpUpdate) -> Result<(), StoreError> {
         self.ensure_initialized().await?;
-        if let Some(state) = update.state {
-            sqlx::query("UPDATE expectations SET state = ?1 WHERE id = ?2")
-                .bind(state)
-                .bind(id)
-                .execute(&self.pool)
-                .await
-                .map_err(|e| StoreError::new(format!("update_expectation state failed: {e}")))?;
-        }
-
-        if let Some(matched_tx_id) = update.matched_tx_id {
-            sqlx::query("UPDATE expectations SET matched_tx_id = ?1 WHERE id = ?2")
-                .bind(matched_tx_id)
-                .bind(id)
-                .execute(&self.pool)
-                .await
-                .map_err(|e| {
-                    StoreError::new(format!("update_expectation matched_tx_id failed: {e}"))
-                })?;
-        }
+        sqlx::query(
+            "UPDATE expectations SET state = COALESCE(?1, state), matched_tx_id = COALESCE(?2, matched_tx_id) WHERE id = ?3",
+        )
+        .bind(update.state)
+        .bind(update.matched_tx_id)
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StoreError::new(format!("update_expectation failed: {e}")))?;
 
         Ok(())
     }
@@ -501,51 +532,48 @@ impl Store for SqliteStore {
         filter: DeadLetterQuery,
     ) -> Result<Vec<DeadLetter>, StoreError> {
         self.ensure_initialized().await?;
-        let rows = sqlx::query(
-            "SELECT dl.id, dl.tx_id, dl.reason, dl.failed_at, dl.raw_message, tx.pipeline
+        let mut qb = QueryBuilder::<Sqlite>::new(
+            "SELECT dl.id, dl.tx_id, dl.reason, dl.failed_at, dl.raw_message
              FROM dead_letters dl
-             LEFT JOIN transactions tx ON tx.tx_id = dl.tx_id
-             ORDER BY dl.failed_at DESC",
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| StoreError::new(format!("list_dead_letters failed: {e}")))?;
-
-        let mut result = Vec::new();
-        for row in rows {
-            let pipeline: Option<String> = row.try_get("pipeline").ok();
-            if let Some(ref required) = filter.pipeline {
-                if pipeline.as_deref() != Some(required.as_str()) {
-                    continue;
-                }
-            }
-
-            result.push(DeadLetter {
-                id: row
-                    .try_get("id")
-                    .map_err(|e| StoreError::new(format!("dead letter id mapping failed: {e}")))?,
-                tx_id: row.try_get("tx_id").map_err(|e| {
-                    StoreError::new(format!("dead letter tx_id mapping failed: {e}"))
-                })?,
-                reason: row.try_get("reason").map_err(|e| {
-                    StoreError::new(format!("dead letter reason mapping failed: {e}"))
-                })?,
-                failed_at: decode_time(&row.try_get::<String, _>("failed_at").map_err(|e| {
-                    StoreError::new(format!("dead letter failed_at mapping failed: {e}"))
-                })?),
-                raw_message: row.try_get("raw_message").map_err(|e| {
-                    StoreError::new(format!("dead letter raw_message mapping failed: {e}"))
-                })?,
-            });
-
-            if let Some(limit) = filter.limit {
-                if result.len() >= limit {
-                    break;
-                }
-            }
+             LEFT JOIN transactions tx ON tx.tx_id = dl.tx_id",
+        );
+        if let Some(pipeline) = &filter.pipeline {
+            qb.push(" WHERE tx.pipeline = ");
+            qb.push_bind(pipeline);
+        }
+        qb.push(" ORDER BY dl.failed_at DESC");
+        if let Some(limit) = filter.limit {
+            qb.push(" LIMIT ");
+            qb.push_bind(i64::try_from(limit).unwrap_or(i64::MAX));
         }
 
-        Ok(result)
+        let rows = qb
+            .build()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| StoreError::new(format!("list_dead_letters failed: {e}")))?;
+
+        rows.into_iter()
+            .map(|row| {
+                Ok(DeadLetter {
+                    id: row.try_get("id").map_err(|e| {
+                        StoreError::new(format!("dead letter id mapping failed: {e}"))
+                    })?,
+                    tx_id: row.try_get("tx_id").map_err(|e| {
+                        StoreError::new(format!("dead letter tx_id mapping failed: {e}"))
+                    })?,
+                    reason: row.try_get("reason").map_err(|e| {
+                        StoreError::new(format!("dead letter reason mapping failed: {e}"))
+                    })?,
+                    failed_at: decode_time(&row.try_get::<String, _>("failed_at").map_err(
+                        |e| StoreError::new(format!("dead letter failed_at mapping failed: {e}")),
+                    )?),
+                    raw_message: row.try_get("raw_message").map_err(|e| {
+                        StoreError::new(format!("dead letter raw_message mapping failed: {e}"))
+                    })?,
+                })
+            })
+            .collect()
     }
 
     async fn replay_dead_letter(&self, id: &str) -> Result<(), StoreError> {
@@ -563,6 +591,53 @@ impl Store for SqliteStore {
         Ok(())
     }
 
+    async fn count_dead_letters(&self, pipeline: Option<&str>) -> Result<usize, StoreError> {
+        self.ensure_initialized().await?;
+        let mut qb = QueryBuilder::<Sqlite>::new(
+            "SELECT COUNT(*) as total
+             FROM dead_letters dl
+             LEFT JOIN transactions tx ON tx.tx_id = dl.tx_id",
+        );
+        if let Some(pipeline) = pipeline {
+            qb.push(" WHERE tx.pipeline = ");
+            qb.push_bind(pipeline);
+        }
+        let row = qb
+            .build()
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| StoreError::new(format!("count_dead_letters failed: {e}")))?;
+        let total = row
+            .try_get::<i64, _>("total")
+            .map_err(|e| StoreError::new(format!("count_dead_letters mapping failed: {e}")))?;
+        Ok(usize::try_from(total.max(0)).unwrap_or(usize::MAX))
+    }
+
+    async fn count_transactions_by_states(&self, states: &[&str]) -> Result<usize, StoreError> {
+        self.ensure_initialized().await?;
+        if states.is_empty() {
+            return Ok(0);
+        }
+        let mut qb = QueryBuilder::<Sqlite>::new(
+            "SELECT COUNT(*) as total FROM transactions WHERE state IN (",
+        );
+        {
+            let mut separated = qb.separated(", ");
+            for state in states {
+                separated.push_bind(*state);
+            }
+        }
+        qb.push(")");
+        let row =
+            qb.build().fetch_one(&self.pool).await.map_err(|e| {
+                StoreError::new(format!("count_transactions_by_states failed: {e}"))
+            })?;
+        let total = row.try_get::<i64, _>("total").map_err(|e| {
+            StoreError::new(format!("count_transactions_by_states mapping failed: {e}"))
+        })?;
+        Ok(usize::try_from(total.max(0)).unwrap_or(usize::MAX))
+    }
+
     async fn health(&self) -> Result<StoreHealth, StoreError> {
         self.ensure_initialized().await?;
         let _ = sqlx::query("SELECT 1")
@@ -573,7 +648,7 @@ impl Store for SqliteStore {
         Ok(StoreHealth {
             ok: true,
             backend: "sqlite".to_string(),
-            details: Some(format!("database_url={}", self.database_url())),
+            details: Some("backend=sqlite".to_string()),
         })
     }
 
@@ -620,7 +695,7 @@ mod tests {
 
     #[tokio::test]
     async fn begin_find_update_complete_transaction() {
-        let store = SqliteStore::new("sqlite::memory:");
+        let store = SqliteStore::new("sqlite::memory:").expect("sqlite store should initialize");
 
         let tx = record("1");
         store
@@ -663,7 +738,7 @@ mod tests {
 
     #[tokio::test]
     async fn expectation_and_dead_letter_round_trip() {
-        let store = SqliteStore::new("sqlite::memory:");
+        let store = SqliteStore::new("sqlite::memory:").expect("sqlite store should initialize");
         let tx = record("2");
         store
             .begin_transaction(&tx)
@@ -754,7 +829,7 @@ mod tests {
 
     #[tokio::test]
     async fn query_applies_sql_filters_and_limit() {
-        let store = SqliteStore::new("sqlite::memory:");
+        let store = SqliteStore::new("sqlite::memory:").expect("sqlite store should initialize");
         let now = SystemTime::now();
 
         let mut a = record("q-a");

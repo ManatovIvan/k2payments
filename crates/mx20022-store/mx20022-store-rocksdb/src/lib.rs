@@ -7,7 +7,7 @@ use mx20022_store::{
     ContextEntry, DeadLetter, DeadLetterQuery, ExpUpdate, Expectation, Outcome, QueryResult, Store,
     StoreError, StoreHealth, StoreQuery, TransactionRecord, TransactionUpdate,
 };
-use rocksdb::{IteratorMode, Options, DB};
+use rocksdb::{Direction, IteratorMode, Options, WriteBatch, DB};
 use serde_json::{json, Map, Value};
 
 pub struct RocksDbStore {
@@ -94,17 +94,50 @@ impl Store for RocksDbStore {
         run_blocking(move || put_value(&db, &key, &value)).await
     }
 
+    async fn batch_append_context_entries(
+        &self,
+        tx_id: &str,
+        entries: &[ContextEntry],
+    ) -> Result<(), StoreError> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let db = Arc::clone(&self.db);
+        let tx_id = tx_id.to_string();
+        let entries = entries.to_vec();
+        run_blocking(move || {
+            let mut batch = WriteBatch::default();
+            for entry in &entries {
+                let written = encode_time(entry.written_at);
+                let key = format!("ctx:{tx_id}:{written}:{}", entry.key);
+                let value = json!({
+                    "tx_id": tx_id,
+                    "key": entry.key,
+                    "writer": entry.writer,
+                    "written_at": written,
+                });
+                let data = serde_json::to_vec(&value)
+                    .map_err(|e| StoreError::new(format!("value encode failed: {e}")))?;
+                batch.put(key.as_bytes(), data);
+            }
+            db.write(batch)
+                .map_err(|e| StoreError::new(format!("rocksdb batch write failed: {e}")))?;
+            Ok(())
+        })
+        .await
+    }
+
     async fn list_context_entries(&self, tx_id: &str) -> Result<Vec<ContextEntry>, StoreError> {
         let db = Arc::clone(&self.db);
         let prefix = format!("ctx:{tx_id}:");
         run_blocking(move || {
             let mut entries = Vec::new();
-            for item in db.iterator(IteratorMode::Start) {
+            for item in db.iterator(IteratorMode::From(prefix.as_bytes(), Direction::Forward)) {
                 let (key, value) =
                     item.map_err(|e| StoreError::new(format!("rocksdb iterator failed: {e}")))?;
-                let key = String::from_utf8_lossy(&key);
-                if !key.starts_with(&prefix) {
-                    continue;
+                let key_str = String::from_utf8_lossy(&key);
+                if !key_str.starts_with(&prefix) {
+                    break;
                 }
                 let value: Value = serde_json::from_slice(&value)
                     .map_err(|e| StoreError::new(format!("context decode failed: {e}")))?;
@@ -176,12 +209,13 @@ impl Store for RocksDbStore {
         let db = Arc::clone(&self.db);
         run_blocking(move || {
             let mut records = Vec::new();
-            for item in db.iterator(IteratorMode::Start) {
+            let prefix = "tx:";
+            for item in db.iterator(IteratorMode::From(prefix.as_bytes(), Direction::Forward)) {
                 let (key, value) =
                     item.map_err(|e| StoreError::new(format!("rocksdb iterator failed: {e}")))?;
-                let key = String::from_utf8_lossy(&key);
-                if !key.starts_with("tx:") {
-                    continue;
+                let key_str = String::from_utf8_lossy(&key);
+                if !key_str.starts_with(prefix) {
+                    break;
                 }
                 let value: Value = serde_json::from_slice(&value)
                     .map_err(|e| StoreError::new(format!("transaction decode failed: {e}")))?;
@@ -246,11 +280,12 @@ impl Store for RocksDbStore {
         let db = Arc::clone(&self.db);
         run_blocking(move || {
             let mut out = Vec::new();
-            for item in db.iterator(IteratorMode::Start) {
+            let prefix = "exp:";
+            for item in db.iterator(IteratorMode::From(prefix.as_bytes(), Direction::Forward)) {
                 let (key, value) =
                     item.map_err(|e| StoreError::new(format!("rocksdb iterator failed: {e}")))?;
-                if !String::from_utf8_lossy(&key).starts_with("exp:") {
-                    continue;
+                if !String::from_utf8_lossy(&key).starts_with(prefix) {
+                    break;
                 }
                 let value: Value = serde_json::from_slice(&value)
                     .map_err(|e| StoreError::new(format!("expectation decode failed: {e}")))?;
@@ -307,11 +342,12 @@ impl Store for RocksDbStore {
         let db = Arc::clone(&self.db);
         run_blocking(move || {
             let mut out = Vec::new();
-            for item in db.iterator(IteratorMode::Start) {
+            let prefix = "dl:";
+            for item in db.iterator(IteratorMode::From(prefix.as_bytes(), Direction::Forward)) {
                 let (key, value) =
                     item.map_err(|e| StoreError::new(format!("rocksdb iterator failed: {e}")))?;
-                if !String::from_utf8_lossy(&key).starts_with("dl:") {
-                    continue;
+                if !String::from_utf8_lossy(&key).starts_with(prefix) {
+                    break;
                 }
                 let value: Value = serde_json::from_slice(&value)
                     .map_err(|e| StoreError::new(format!("dead letter decode failed: {e}")))?;
@@ -355,7 +391,7 @@ impl Store for RocksDbStore {
 
     async fn health(&self) -> Result<StoreHealth, StoreError> {
         let db = Arc::clone(&self.db);
-        let path = self.path.clone();
+        let _path = self.path.clone();
         run_blocking(move || {
             let _ = db
                 .property_value("rocksdb.stats")
@@ -363,7 +399,7 @@ impl Store for RocksDbStore {
             Ok(StoreHealth {
                 ok: true,
                 backend: "rocksdb".to_string(),
-                details: Some(format!("path={path}")),
+                details: Some("backend=rocksdb".to_string()),
             })
         })
         .await
@@ -388,11 +424,12 @@ async fn find_by_key_field(
     let value = value.to_string();
     run_blocking(move || {
         let mut out = Vec::new();
-        for item in db.iterator(IteratorMode::Start) {
+        let prefix = "tx:";
+        for item in db.iterator(IteratorMode::From(prefix.as_bytes(), Direction::Forward)) {
             let (key, val) =
                 item.map_err(|e| StoreError::new(format!("rocksdb iterator failed: {e}")))?;
-            if !String::from_utf8_lossy(&key).starts_with("tx:") {
-                continue;
+            if !String::from_utf8_lossy(&key).starts_with(prefix) {
+                break;
             }
             let json: Value = serde_json::from_slice(&val)
                 .map_err(|e| StoreError::new(format!("transaction decode failed: {e}")))?;

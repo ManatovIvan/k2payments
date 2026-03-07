@@ -21,10 +21,10 @@ impl ErrorResponseBuilder {
     }
 
     fn build_error_xml(&self, ctx: &Context, reason: &str) -> String {
+        let tx_id = crate::escape_xml(ctx.transaction_id());
+        let reason = crate::escape_xml(reason);
         format!(
             "<Document><FIToFIPmtStsRpt><GrpHdr><MsgId>{tx_id}</MsgId></GrpHdr><TxInfAndSts><OrgnlMsgId>{tx_id}</OrgnlMsgId><TxSts>RJCT</TxSts><StsRsnInf><Rsn><Prtry>{reason}</Prtry></Rsn></StsRsnInf></TxInfAndSts></FIToFIPmtStsRpt></Document>",
-            tx_id = ctx.transaction_id(),
-            reason = reason,
         )
     }
 }

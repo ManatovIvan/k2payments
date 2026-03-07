@@ -141,21 +141,25 @@ fn map_controller_error(error: AdminControllerError) -> HttpResponse {
             status: 403,
             body: "{\"error\":\"forbidden\"}".to_string(),
         },
-        AdminControllerError::Internal(message) => HttpResponse {
-            status: 500,
-            body: format!("{{\"error\":\"{}\"}}", message.replace('"', "'")),
-        },
+        AdminControllerError::Internal(message) => {
+            tracing::error!(error = %message, "admin request failed");
+            HttpResponse {
+                status: 500,
+                body: "{\"error\":\"internal server error\"}".to_string(),
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::sync::{Arc, RwLock};
+    use std::sync::Arc;
     use std::time::SystemTime;
 
     use mx20022_store::{Store, TransactionRecord};
     use mx20022_store_sqlite::SqliteStore;
+    use tokio::sync::RwLock;
 
     use crate::http::{dispatch, HttpRequest};
     use crate::routes::HttpMethod;
@@ -163,7 +167,8 @@ mod tests {
 
     #[tokio::test]
     async fn dispatches_status_and_tx_routes() {
-        let store: Arc<dyn Store> = Arc::new(SqliteStore::new("sqlite::memory:"));
+        let store: Arc<dyn Store> =
+            Arc::new(SqliteStore::new("sqlite::memory:").expect("sqlite store should initialize"));
 
         store
             .begin_transaction(&TransactionRecord {

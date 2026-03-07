@@ -13,7 +13,7 @@ mx20022-model.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
 regex = "1"
+tokio.workspace = true
 
 [dev-dependencies]
-tokio.workspace = true
 mx20022-store-sqlite = { path = "../mx20022-store/mx20022-store-sqlite" }

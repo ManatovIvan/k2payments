@@ -92,7 +92,8 @@ impl InboundChannel for AmqpInboundChannel {
 
             sender
                 .send(InboundMessage {
-                    raw: String::from_utf8_lossy(&delivery.data).to_string(),
+                    raw: String::from_utf8(delivery.data.to_vec())
+                        .map_err(|_| ChannelError::new("amqp payload is not valid UTF-8"))?,
                     content_type: self.config.content_type.clone(),
                 })
                 .await

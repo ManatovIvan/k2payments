@@ -75,10 +75,11 @@ impl InboundChannel for KafkaInboundChannel {
             let message =
                 message.map_err(|e| ChannelError::new(format!("kafka recv failed: {e}")))?;
 
-            let payload = message
-                .payload()
-                .map(|v| String::from_utf8_lossy(v).to_string())
-                .unwrap_or_default();
+            let payload = match message.payload() {
+                Some(value) => String::from_utf8(value.to_vec())
+                    .map_err(|_| ChannelError::new("kafka payload is not valid UTF-8"))?,
+                None => String::new(),
+            };
             sender
                 .send(InboundMessage {
                     raw: payload,
