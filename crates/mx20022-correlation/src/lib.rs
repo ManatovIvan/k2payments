@@ -89,14 +89,28 @@ impl CorrelationEngine {
             let mut index = self.index.write().await;
             index.remove(&key)
         };
-
-        let Some(expectation) = expectation else {
-            return Ok(false);
+        let expectation_id = if let Some(expectation) = expectation {
+            expectation.expectation_id
+        } else {
+            let pending = self
+                .store
+                .load_pending_expectations()
+                .await
+                .map_err(CorrelationError::Store)?;
+            let Some(found) = pending.into_iter().find(|exp| {
+                exp.correlation_key == key.correlation_key
+                    && exp.expected_message_type == key.expected_message_type
+            }) else {
+                return Ok(false);
+            };
+            let mut index = self.index.write().await;
+            index.remove(&key);
+            found.id
         };
 
         self.store
             .update_expectation(
-                &expectation.expectation_id,
+                &expectation_id,
                 ExpUpdate {
                     state: Some("MATCHED".to_string()),
                     matched_tx_id: Some(matched_tx_id),
@@ -110,22 +124,28 @@ impl CorrelationEngine {
 
     pub async fn timeout_scan(&self, now: SystemTime) -> Result<Vec<String>, CorrelationError> {
         let timed_out = {
-            let mut index = self.index.write().await;
-            let mut timed_out = Vec::new();
-
-            index.retain(|_, value| {
-                if value.timeout_at <= now {
-                    timed_out.push(value.expectation_id.clone());
-                    false
-                } else {
-                    true
-                }
-            });
-
-            timed_out
+            let index = self.index.read().await;
+            index
+                .iter()
+                .filter(|(_, value)| value.timeout_at <= now)
+                .map(|(key, value)| (key.clone(), value.expectation_id.clone()))
+                .collect::<Vec<_>>()
         };
+        if timed_out.is_empty() {
+            return Ok(Vec::new());
+        }
+        {
+            let mut index = self.index.write().await;
+            for (key, _) in &timed_out {
+                let _ = index.remove(key);
+            }
+        }
+        let timed_out_ids = timed_out
+            .iter()
+            .map(|(_, expectation_id)| expectation_id.clone())
+            .collect::<Vec<_>>();
 
-        for id in &timed_out {
+        for id in &timed_out_ids {
             self.store
                 .update_expectation(
                     id,
@@ -138,7 +158,7 @@ impl CorrelationEngine {
                 .map_err(CorrelationError::Store)?;
         }
 
-        Ok(timed_out)
+        Ok(timed_out_ids)
     }
 
     pub fn spawn_timeout_worker(self: Arc<Self>, interval: Duration) {
@@ -223,5 +243,39 @@ mod tests {
 
         assert_eq!(timed_out.len(), 1);
         assert_eq!(timed_out[0], "EXP-2");
+    }
+
+    #[tokio::test]
+    async fn match_response_falls_back_to_store_for_distributed_nodes() {
+        let store: Arc<dyn Store> =
+            Arc::new(SqliteStore::new("sqlite::memory:").expect("sqlite store should initialize"));
+        let node_a = CorrelationEngine::new(Arc::clone(&store))
+            .await
+            .expect("node A should build");
+        let node_b = CorrelationEngine::new(store)
+            .await
+            .expect("node B should build");
+
+        node_a
+            .register(mx20022_store::Expectation {
+                id: "EXP-DIST-1".to_string(),
+                correlation_key: "MSG-DIST-1".to_string(),
+                expected_message_type: "pacs.002".to_string(),
+                timeout_at: SystemTime::now() + Duration::from_secs(30),
+            })
+            .await
+            .expect("register should work");
+
+        let matched = node_b
+            .match_response(
+                CorrelationLookupKey {
+                    correlation_key: "MSG-DIST-1".to_string(),
+                    expected_message_type: "pacs.002".to_string(),
+                },
+                "TX-DIST-1".to_string(),
+            )
+            .await
+            .expect("match should work");
+        assert!(matched);
     }
 }

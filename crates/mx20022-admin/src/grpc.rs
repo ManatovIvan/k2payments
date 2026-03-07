@@ -6,6 +6,7 @@ use tonic::{Request, Response, Status};
 
 use crate::auth::{authorize_request, AdminResource, AuthConfig, AuthError};
 use crate::controller::{AdminController, AdminControllerError};
+use crate::rate_limit::AdminRateLimiter;
 use crate::tls::TlsConfig;
 
 pub mod proto {
@@ -16,11 +17,16 @@ pub mod proto {
 pub struct AdminGrpcService {
     controller: Arc<dyn AdminController>,
     auth: AuthConfig,
+    rate_limiter: Arc<AdminRateLimiter>,
 }
 
 impl AdminGrpcService {
     pub fn new(controller: Arc<dyn AdminController>, auth: AuthConfig) -> Self {
-        Self { controller, auth }
+        Self {
+            controller,
+            auth,
+            rate_limiter: Arc::new(AdminRateLimiter::default()),
+        }
     }
 }
 
@@ -43,8 +49,7 @@ impl proto::admin_service_server::AdminService for AdminGrpcService {
         &self,
         request: Request<()>,
     ) -> Result<Response<proto::ReadyResponse>, Status> {
-        self.authorize(&request, AdminResource::Ready)
-            .map_err(map_auth_error)?;
+        self.authorize(&request, AdminResource::Ready).await?;
         let dto = self
             .controller
             .get_ready()
@@ -61,8 +66,7 @@ impl proto::admin_service_server::AdminService for AdminGrpcService {
         &self,
         request: Request<()>,
     ) -> Result<Response<proto::StatusResponse>, Status> {
-        self.authorize(&request, AdminResource::Status)
-            .map_err(map_auth_error)?;
+        self.authorize(&request, AdminResource::Status).await?;
         let dto = self
             .controller
             .get_status()
@@ -90,8 +94,7 @@ impl proto::admin_service_server::AdminService for AdminGrpcService {
         &self,
         request: Request<proto::GetTransactionRequest>,
     ) -> Result<Response<proto::TransactionResponse>, Status> {
-        self.authorize(&request, AdminResource::Transaction)
-            .map_err(map_auth_error)?;
+        self.authorize(&request, AdminResource::Transaction).await?;
         let tx_id = request.into_inner().tx_id;
         let dto = self
             .controller
@@ -113,8 +116,7 @@ impl proto::admin_service_server::AdminService for AdminGrpcService {
         &self,
         request: Request<()>,
     ) -> Result<Response<proto::ReloadResponse>, Status> {
-        self.authorize(&request, AdminResource::Reload)
-            .map_err(map_auth_error)?;
+        self.authorize(&request, AdminResource::Reload).await?;
         let dto = self
             .controller
             .reload_config()
@@ -129,7 +131,11 @@ impl proto::admin_service_server::AdminService for AdminGrpcService {
 }
 
 impl AdminGrpcService {
-    fn authorize<T>(&self, request: &Request<T>, resource: AdminResource) -> Result<(), AuthError> {
+    async fn authorize<T>(
+        &self,
+        request: &Request<T>,
+        resource: AdminResource,
+    ) -> Result<(), Status> {
         let metadata = request.metadata();
         let bearer = metadata
             .get("authorization")
@@ -137,7 +143,19 @@ impl AdminGrpcService {
         let mtls = metadata
             .get(self.auth.mtls_subject_header.as_str())
             .and_then(|value| value.to_str().ok());
-        authorize_request(&self.auth, resource, bearer, mtls)
+        let rate_key = metadata
+            .get("x-forwarded-for")
+            .and_then(|value| value.to_str().ok())
+            .or(metadata
+                .get("x-real-ip")
+                .and_then(|value| value.to_str().ok()))
+            .or(mtls)
+            .or(bearer)
+            .unwrap_or("anonymous");
+        if !self.rate_limiter.allow(&format!("{resource:?}:{rate_key}")) {
+            return Err(Status::resource_exhausted("rate limit exceeded"));
+        }
+        authorize_request(&self.auth, resource, bearer, mtls).map_err(map_auth_error)
     }
 }
 

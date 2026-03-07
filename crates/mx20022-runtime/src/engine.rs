@@ -20,6 +20,7 @@ use mx20022_channel_tcp::{TcpFraming, TcpInboundChannel, TcpInboundConfig};
 use mx20022_channels::auth::{InboundAuthConfig, InboundAuthMode};
 use mx20022_channels::{InboundChannel, InboundMessage};
 use mx20022_config::{ChannelSection, RuntimeConfig};
+use secrecy::{ExposeSecret, SecretString};
 use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinSet;
 
@@ -58,6 +59,8 @@ pub async fn run_pipelines(app: Arc<RuntimeApp>, config: RuntimeConfig) -> Resul
                         channel_cfg,
                         "cors_allowed_origins",
                     ),
+                    tls_cert_path: extract_optional(channel_cfg, "tls_cert"),
+                    tls_key_path: extract_optional(channel_cfg, "tls_key"),
                 })),
                 #[cfg(feature = "channel-file")]
                 ("file", "watch") => Arc::new(FileInboundChannel::new(
@@ -75,6 +78,8 @@ pub async fn run_pipelines(app: Arc<RuntimeApp>, config: RuntimeConfig) -> Resul
                     name: channel_name.clone(),
                     bind: extract_bind(channel_cfg)?,
                     auth: extract_inbound_auth(channel_cfg)?,
+                    tls_cert_path: extract_optional(channel_cfg, "tls_cert"),
+                    tls_key_path: extract_optional(channel_cfg, "tls_key"),
                 })),
                 #[cfg(feature = "channel-tcp")]
                 ("tcp", "server") => Arc::new(TcpInboundChannel::new(TcpInboundConfig {
@@ -83,7 +88,8 @@ pub async fn run_pipelines(app: Arc<RuntimeApp>, config: RuntimeConfig) -> Resul
                     framing: extract_tcp_framing(channel_cfg),
                     content_type: extract_optional(channel_cfg, "content_type")
                         .unwrap_or_else(|| "application/xml".to_string()),
-                    auth_token: extract_optional(channel_cfg, "auth_token"),
+                    auth_token: extract_optional(channel_cfg, "auth_token")
+                        .map(|value| SecretString::new(value.into_boxed_str())),
                 })),
                 #[cfg(feature = "channel-nats")]
                 ("nats", "subscriber") => Arc::new(NatsInboundChannel::new(NatsInboundConfig {
@@ -111,6 +117,9 @@ pub async fn run_pipelines(app: Arc<RuntimeApp>, config: RuntimeConfig) -> Resul
                         .unwrap_or_else(|| format!("mxruntime-{}", channel_name)),
                     content_type: extract_optional(channel_cfg, "content_type")
                         .unwrap_or_else(|| "application/xml".to_string()),
+                    security_protocol: extract_optional(channel_cfg, "security_protocol"),
+                    ssl_ca_location: extract_optional(channel_cfg, "ssl_ca_location")
+                        .or_else(|| extract_optional(channel_cfg, "tls_ca_cert")),
                 })),
                 #[cfg(feature = "channel-amqp")]
                 ("amqp", "consumer") => Arc::new(AmqpInboundChannel::new(AmqpInboundConfig {
@@ -362,8 +371,10 @@ fn extract_inbound_auth(channel_cfg: &ChannelSection) -> Result<InboundAuthConfi
 
     let auth = InboundAuthConfig {
         mode,
-        bearer_token: extract_optional(channel_cfg, "auth_bearer_token"),
-        jwt_hs256_secret: extract_optional(channel_cfg, "auth_jwt_hs256_secret"),
+        bearer_token: extract_optional(channel_cfg, "auth_bearer_token")
+            .map(|value| SecretString::new(value.into_boxed_str())),
+        jwt_hs256_secret: extract_optional(channel_cfg, "auth_jwt_hs256_secret")
+            .map(|value| SecretString::new(value.into_boxed_str())),
         jwt_issuer: extract_optional(channel_cfg, "auth_jwt_issuer"),
         jwt_audience: extract_optional(channel_cfg, "auth_jwt_audience"),
         required_roles,
@@ -400,7 +411,7 @@ fn extract_inbound_auth(channel_cfg: &ChannelSection) -> Result<InboundAuthConfi
             if auth
                 .bearer_token
                 .as_ref()
-                .map(|value| !value.trim().is_empty())
+                .map(|value| !value.expose_secret().trim().is_empty())
                 .unwrap_or(false)
             {
                 Ok(auth)
@@ -414,7 +425,7 @@ fn extract_inbound_auth(channel_cfg: &ChannelSection) -> Result<InboundAuthConfi
             if auth
                 .jwt_hs256_secret
                 .as_ref()
-                .map(|value| !value.trim().is_empty())
+                .map(|value| !value.expose_secret().trim().is_empty())
                 .unwrap_or(false)
             {
                 Ok(auth)
@@ -472,6 +483,7 @@ pub enum EngineError {
 mod tests {
     use mx20022_channels::InboundMessage;
     use mx20022_config::RuntimeConfig;
+    use secrecy::ExposeSecret;
 
     use super::{build_tx_id_prefix, infer_message_type, next_tx_id};
     #[cfg(any(feature = "channel-http", feature = "channel-grpc"))]
@@ -565,6 +577,11 @@ auth_bearer_token = "secret"
         );
         let channel = cfg.channels.get("http-in").expect("channel should exist");
         let auth = extract_inbound_auth(channel).expect("auth should parse");
-        assert!(auth.bearer_token.as_deref() == Some("secret"));
+        assert!(
+            auth.bearer_token
+                .as_ref()
+                .map(|value| value.expose_secret())
+                == Some("secret")
+        );
     }
 }

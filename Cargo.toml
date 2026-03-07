@@ -51,6 +51,7 @@ mx20022-parse = "0.1.1"
 mx20022-validate = "0.1.1"
 mx20022-model = "0.1.1"
 subtle = "2.5"
+secrecy = { version = "0.10", features = ["serde"] }
 
 [profile.release]
 lto = "fat"

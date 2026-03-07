@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 
 use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
+use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use subtle::ConstantTimeEq;
 
@@ -22,9 +23,9 @@ pub enum AuthMode {
 #[derive(Clone)]
 pub struct AuthConfig {
     pub mode: AuthMode,
-    pub jwt_hs256_secret: Option<String>,
-    pub legacy_bearer_token: Option<String>,
-    pub legacy_readonly_token: Option<String>,
+    pub jwt_hs256_secret: Option<SecretString>,
+    pub legacy_bearer_token: Option<SecretString>,
+    pub legacy_readonly_token: Option<SecretString>,
     pub jwt_issuer: Option<String>,
     pub jwt_audience: Option<String>,
     pub ready_roles: Vec<String>,
@@ -138,12 +139,14 @@ fn authorize_legacy(
     }
     let admin_token = config
         .legacy_bearer_token
-        .as_deref()
+        .as_ref()
+        .map(ExposeSecret::expose_secret)
         .filter(|value| !value.trim().is_empty())
         .map(ToString::to_string);
     let readonly_token = config
         .legacy_readonly_token
-        .as_deref()
+        .as_ref()
+        .map(ExposeSecret::expose_secret)
         .filter(|value| !value.trim().is_empty())
         .map(ToString::to_string);
 
@@ -174,7 +177,8 @@ fn authorize_jwt(
     let token = parse_bearer_token(bearer_header).ok_or(AuthError::MissingBearer)?;
     let secret = config
         .jwt_hs256_secret
-        .as_deref()
+        .as_ref()
+        .map(ExposeSecret::expose_secret)
         .ok_or(AuthError::InvalidBearer)?;
 
     let mut validation = Validation::new(Algorithm::HS256);
@@ -284,6 +288,7 @@ fn constant_time_eq(left: &str, right: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use jsonwebtoken::{encode, EncodingKey, Header};
+    use secrecy::SecretString;
     use serde::Serialize;
 
     use super::{
@@ -301,7 +306,7 @@ mod tests {
     fn jwt_mode_requires_expected_roles() {
         let cfg = AuthConfig {
             mode: AuthMode::JwtHs256,
-            jwt_hs256_secret: Some("test-secret".to_string()),
+            jwt_hs256_secret: Some(SecretString::new("test-secret".into())),
             tx_roles: vec!["admin.tx.read".to_string()],
             ..AuthConfig::default()
         };
@@ -331,7 +336,7 @@ mod tests {
     fn jwt_mode_denies_missing_role() {
         let cfg = AuthConfig {
             mode: AuthMode::JwtHs256,
-            jwt_hs256_secret: Some("test-secret".to_string()),
+            jwt_hs256_secret: Some(SecretString::new("test-secret".into())),
             tx_roles: vec!["admin.tx.read".to_string()],
             ..AuthConfig::default()
         };
@@ -389,8 +394,8 @@ mod tests {
     fn legacy_mode_readonly_token_cannot_access_write_paths() {
         let cfg = AuthConfig {
             mode: AuthMode::LegacyBearer,
-            legacy_bearer_token: Some("admin-token".to_string()),
-            legacy_readonly_token: Some("readonly-token".to_string()),
+            legacy_bearer_token: Some(SecretString::new("admin-token".into())),
+            legacy_readonly_token: Some(SecretString::new("readonly-token".into())),
             ..AuthConfig::default()
         };
 

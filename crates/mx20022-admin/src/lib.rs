@@ -7,6 +7,7 @@ pub mod grpc;
 pub mod host;
 pub mod http;
 pub mod middleware;
+pub mod rate_limit;
 pub mod routes;
 pub mod service;
 pub mod tls;

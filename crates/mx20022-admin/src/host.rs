@@ -14,6 +14,7 @@ use tower_http::cors::CorsLayer;
 
 use crate::auth::{authorize_request, AdminResource, AuthConfig, AuthError};
 use crate::controller::{AdminController, AdminControllerError};
+use crate::rate_limit::AdminRateLimiter;
 use crate::tls::TlsConfig;
 
 const MAX_ADMIN_BODY_BYTES: usize = 10 * 1024 * 1024;
@@ -22,6 +23,7 @@ const MAX_ADMIN_BODY_BYTES: usize = 10 * 1024 * 1024;
 struct HostState {
     controller: Arc<dyn AdminController>,
     auth: AuthConfig,
+    rate_limiter: Arc<AdminRateLimiter>,
 }
 
 pub async fn serve(
@@ -48,7 +50,11 @@ pub async fn serve_with_tls_and_cors(
     tls: Option<TlsConfig>,
     allowed_origins: Vec<String>,
 ) -> Result<(), HostError> {
-    let state = HostState { controller, auth };
+    let state = HostState {
+        controller,
+        auth,
+        rate_limiter: Arc::new(AdminRateLimiter::default()),
+    };
 
     let router = Router::new()
         .route("/health", get(get_health))
@@ -156,7 +162,7 @@ async fn get_ready(
     State(state): State<HostState>,
     headers: HeaderMap,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
-    authorize(&state.auth, &headers, AdminResource::Ready)?;
+    authorize(&state, &headers, AdminResource::Ready)?;
 
     state
         .controller
@@ -183,7 +189,7 @@ async fn get_status(
     State(state): State<HostState>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    authorize(&state.auth, &headers, AdminResource::Status)?;
+    authorize(&state, &headers, AdminResource::Status)?;
 
     state
         .controller
@@ -214,7 +220,7 @@ async fn get_tx(
     Path(tx_id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    authorize(&state.auth, &headers, AdminResource::Transaction)?;
+    authorize(&state, &headers, AdminResource::Transaction)?;
 
     state
         .controller
@@ -237,7 +243,7 @@ async fn reload_config(
     State(state): State<HostState>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    authorize(&state.auth, &headers, AdminResource::Reload)?;
+    authorize(&state, &headers, AdminResource::Reload)?;
 
     state
         .controller
@@ -253,15 +259,28 @@ async fn reload_config(
 }
 
 fn authorize(
-    config: &AuthConfig,
+    state: &HostState,
     headers: &HeaderMap,
     resource: AdminResource,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
     let bearer = headers.get("authorization").and_then(|h| h.to_str().ok());
     let mtls = headers
-        .get(config.mtls_subject_header.as_str())
+        .get(state.auth.mtls_subject_header.as_str())
         .and_then(|h| h.to_str().ok());
-    authorize_request(config, resource, bearer, mtls).map_err(map_auth_error)
+    let key = headers
+        .get("x-forwarded-for")
+        .and_then(|h| h.to_str().ok())
+        .or(headers.get("x-real-ip").and_then(|h| h.to_str().ok()))
+        .or(mtls)
+        .or(bearer)
+        .unwrap_or("anonymous");
+    if !state.rate_limiter.allow(&format!("{resource:?}:{key}")) {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({"error": "rate limit exceeded"})),
+        ));
+    }
+    authorize_request(&state.auth, resource, bearer, mtls).map_err(map_auth_error)
 }
 
 fn map_error(error: AdminControllerError) -> (StatusCode, Json<serde_json::Value>) {

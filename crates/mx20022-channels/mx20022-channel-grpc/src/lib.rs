@@ -10,7 +10,7 @@ use mx20022_channels::{
 };
 use tokio::sync::{mpsc, Mutex};
 use tokio_stream::wrappers::TcpListenerStream;
-use tonic::transport::{Channel, Endpoint, Server};
+use tonic::transport::{Channel, ClientTlsConfig, Endpoint, Identity, Server, ServerTlsConfig};
 use tonic::{Request, Response, Status};
 
 pub mod proto {
@@ -22,6 +22,8 @@ pub struct GrpcInboundConfig {
     pub name: String,
     pub bind: String,
     pub auth: InboundAuthConfig,
+    pub tls_cert_path: Option<String>,
+    pub tls_key_path: Option<String>,
 }
 
 #[derive(Clone)]
@@ -52,7 +54,17 @@ impl GrpcInboundChannel {
             auth: self.config.auth.clone(),
         };
 
-        Server::builder()
+        let mut builder = Server::builder();
+        if let Some(identity) = self.load_inbound_identity()? {
+            let tls = ServerTlsConfig::new().identity(identity);
+            builder = builder
+                .tls_config(tls)
+                .map_err(|e| ChannelError::new(format!("grpc inbound tls config failed: {e}")))?;
+        } else {
+            tracing::warn!(channel = %self.config.name, bind = %self.config.bind, "grpc inbound channel starting without TLS");
+        }
+
+        builder
             .add_service(proto::runtime_channel_server::RuntimeChannelServer::new(
                 service,
             ))
@@ -139,7 +151,17 @@ impl InboundChannel for GrpcInboundChannel {
             auth: self.config.auth.clone(),
         };
 
-        Server::builder()
+        let mut builder = Server::builder();
+        if let Some(identity) = self.load_inbound_identity()? {
+            let tls = ServerTlsConfig::new().identity(identity);
+            builder = builder
+                .tls_config(tls)
+                .map_err(|e| ChannelError::new(format!("grpc inbound tls config failed: {e}")))?;
+        } else {
+            tracing::warn!(channel = %self.config.name, bind = %self.config.bind, "grpc inbound channel starting without TLS");
+        }
+
+        builder
             .add_service(proto::runtime_channel_server::RuntimeChannelServer::new(
                 service,
             ))
@@ -179,6 +201,7 @@ impl InboundChannel for GrpcInboundChannel {
 pub struct GrpcOutboundConfig {
     pub name: String,
     pub endpoint: String,
+    pub tls_ca_cert_path: Option<String>,
 }
 
 #[derive(Clone)]
@@ -207,6 +230,21 @@ impl GrpcOutboundChannel {
 
         let endpoint = Endpoint::from_shared(self.config.endpoint.clone())
             .map_err(|e| ChannelError::new(format!("invalid grpc endpoint: {e}")))?;
+        let endpoint = if self.config.endpoint.starts_with("https://") {
+            let mut tls = ClientTlsConfig::new();
+            if let Some(path) = self.config.tls_ca_cert_path.as_deref() {
+                let pem = std::fs::read(path).map_err(|e| {
+                    ChannelError::new(format!("failed to read grpc CA cert `{path}`: {e}"))
+                })?;
+                tls = tls.ca_certificate(tonic::transport::Certificate::from_pem(pem));
+            }
+            endpoint
+                .tls_config(tls)
+                .map_err(|e| ChannelError::new(format!("grpc tls config failed: {e}")))?
+        } else {
+            tracing::warn!(channel = %self.config.name, endpoint = %self.config.endpoint, "grpc outbound channel using plaintext endpoint");
+            endpoint
+        };
         let channel = endpoint
             .connect()
             .await
@@ -214,6 +252,29 @@ impl GrpcOutboundChannel {
         let client = proto::runtime_channel_client::RuntimeChannelClient::new(channel);
         *guard = Some(client.clone());
         Ok(client)
+    }
+}
+
+impl GrpcInboundChannel {
+    fn load_inbound_identity(&self) -> Result<Option<Identity>, ChannelError> {
+        match (
+            self.config.tls_cert_path.as_deref(),
+            self.config.tls_key_path.as_deref(),
+        ) {
+            (Some(cert_path), Some(key_path)) => {
+                let cert = std::fs::read_to_string(cert_path).map_err(|e| {
+                    ChannelError::new(format!("failed to read grpc cert `{cert_path}`: {e}"))
+                })?;
+                let key = std::fs::read_to_string(key_path).map_err(|e| {
+                    ChannelError::new(format!("failed to read grpc key `{key_path}`: {e}"))
+                })?;
+                Ok(Some(Identity::from_pem(cert, key)))
+            }
+            (None, None) => Ok(None),
+            _ => Err(ChannelError::new(
+                "grpc inbound TLS requires both tls_cert and tls_key",
+            )),
+        }
     }
 }
 
@@ -278,6 +339,8 @@ mod tests {
             name: "grpc-in".to_string(),
             bind: local_addr.to_string(),
             auth: mx20022_channels::auth::InboundAuthConfig::default(),
+            tls_cert_path: None,
+            tls_key_path: None,
         });
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let runner = inbound.clone();
@@ -290,6 +353,7 @@ mod tests {
         let outbound = GrpcOutboundChannel::new(GrpcOutboundConfig {
             name: "grpc-out".to_string(),
             endpoint: format!("http://{}", local_addr),
+            tls_ca_cert_path: None,
         });
 
         let receipt = outbound

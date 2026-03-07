@@ -37,6 +37,7 @@ tokio.workspace = true
 thiserror.workspace = true
 async-trait.workspace = true
 sha2 = "0.10"
+secrecy.workspace = true
 
 [features]
 default = ["channel-http", "channel-grpc", "store-postgres", "store-sqlite"]
@@ -53,3 +54,11 @@ store-rocksdb = ["dep:mx20022-store-rocksdb"]
 all-channels = ["channel-http", "channel-grpc", "channel-kafka", "channel-amqp", "channel-file", "channel-nats", "channel-tcp"]
 all-stores = ["store-postgres", "store-sqlite", "store-rocksdb"]
 full = ["all-channels", "all-stores"]
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["async_tokio"] }
+tempfile = "3"
+
+[[bench]]
+name = "runtime_hot_paths"
+harness = false

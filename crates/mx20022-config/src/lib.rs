@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
+use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -78,6 +79,10 @@ impl RuntimeConfig {
             }
         }
 
+        for (channel_name, channel) in &self.channels {
+            validate_channel_security(channel_name, channel, self.runtime.enforce_secure_channels)?;
+        }
+
         let auth = &self.runtime.admin_auth;
         match auth.mode.as_str() {
             "disabled" => {
@@ -92,7 +97,7 @@ impl RuntimeConfig {
                 if auth
                     .legacy_bearer_token
                     .as_ref()
-                    .map(|value| value.trim().is_empty())
+                    .map(|value| value.expose_secret().trim().is_empty())
                     .unwrap_or(true)
                 {
                     return Err(ConfigError::Validation(
@@ -105,7 +110,7 @@ impl RuntimeConfig {
                 if auth
                     .jwt_hs256_secret
                     .as_ref()
-                    .map(|value| value.trim().is_empty())
+                    .map(|value| value.expose_secret().trim().is_empty())
                     .unwrap_or(true)
                 {
                     return Err(ConfigError::Validation(
@@ -219,6 +224,8 @@ pub struct RuntimeSection {
     #[serde(default)]
     pub admin_cors_allowed_origins: Vec<String>,
     #[serde(default)]
+    pub enforce_secure_channels: bool,
+    #[serde(default)]
     pub correlation_scan_interval_ms: Option<u64>,
     #[serde(default)]
     pub participant_reload_poll_ms: Option<u64>,
@@ -234,6 +241,73 @@ pub struct RuntimeSection {
     pub admin_tls_key: Option<String>,
 }
 
+fn validate_channel_security(
+    channel_name: &str,
+    channel: &ChannelSection,
+    enforce_secure_channels: bool,
+) -> Result<(), ConfigError> {
+    if channel.channel_type == "file" {
+        return Ok(());
+    }
+    let allow_plaintext = channel
+        .extra
+        .get("allow_plaintext")
+        .and_then(toml::Value::as_bool)
+        .unwrap_or(false);
+    let secure = is_channel_secure(channel);
+    if secure || allow_plaintext {
+        return Ok(());
+    }
+
+    if enforce_secure_channels {
+        return Err(ConfigError::Validation(format!(
+            "channel `{channel_name}` type=`{}` mode=`{}` is plaintext; configure TLS or set allow_plaintext=true for an explicit exception",
+            channel.channel_type, channel.mode
+        )));
+    }
+
+    tracing::warn!(
+        channel = %channel_name,
+        channel_type = %channel.channel_type,
+        mode = %channel.mode,
+        "channel is configured without transport security"
+    );
+    Ok(())
+}
+
+fn is_channel_secure(channel: &ChannelSection) -> bool {
+    let has_server_tls = matches!(
+        (
+            channel.extra.get("tls_cert").and_then(toml::Value::as_str),
+            channel.extra.get("tls_key").and_then(toml::Value::as_str),
+        ),
+        (Some(_), Some(_))
+    );
+
+    let endpoint_like = channel
+        .extra
+        .get("endpoint")
+        .and_then(toml::Value::as_str)
+        .or_else(|| channel.extra.get("url").and_then(toml::Value::as_str))
+        .unwrap_or_default();
+    let uses_secure_url = endpoint_like.starts_with("https://")
+        || endpoint_like.starts_with("amqps://")
+        || endpoint_like.starts_with("tls://");
+    let kafka_secure = channel
+        .extra
+        .get("security_protocol")
+        .and_then(toml::Value::as_str)
+        .map(|value| matches!(value.to_ascii_uppercase().as_str(), "SSL" | "SASL_SSL"))
+        .unwrap_or(false);
+    let tcp_tls_enabled = channel
+        .extra
+        .get("tls_enabled")
+        .and_then(toml::Value::as_bool)
+        .unwrap_or(false);
+
+    has_server_tls || uses_secure_url || kafka_secure || tcp_tls_enabled
+}
+
 fn default_log_level() -> String {
     "info".to_string()
 }
@@ -247,11 +321,11 @@ pub struct AdminAuthSection {
     #[serde(default = "default_admin_auth_mode")]
     pub mode: String,
     #[serde(default)]
-    pub jwt_hs256_secret: Option<String>,
+    pub jwt_hs256_secret: Option<SecretString>,
     #[serde(default)]
-    pub legacy_bearer_token: Option<String>,
+    pub legacy_bearer_token: Option<SecretString>,
     #[serde(default)]
-    pub legacy_readonly_token: Option<String>,
+    pub legacy_readonly_token: Option<SecretString>,
     #[serde(default)]
     pub jwt_issuer: Option<String>,
     #[serde(default)]
@@ -406,6 +480,8 @@ pub enum ConfigError {
 mod tests {
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    use secrecy::ExposeSecret;
 
     use super::RuntimeConfig;
 
@@ -762,7 +838,12 @@ jwt_hs256_secret = "${{MX20022_TEST_SECRET}}"
         );
         let parsed = RuntimeConfig::parse(&config).expect("config should parse");
         assert_eq!(
-            parsed.runtime.admin_auth.jwt_hs256_secret.as_deref(),
+            parsed
+                .runtime
+                .admin_auth
+                .jwt_hs256_secret
+                .as_ref()
+                .map(|secret| secret.expose_secret()),
             Some("from-env")
         );
     }
@@ -786,10 +867,57 @@ jwt_hs256_secret = "secret://{}"
         );
         let parsed = RuntimeConfig::parse(&config).expect("config should parse");
         assert_eq!(
-            parsed.runtime.admin_auth.jwt_hs256_secret.as_deref(),
+            parsed
+                .runtime
+                .admin_auth
+                .jwt_hs256_secret
+                .as_ref()
+                .map(|secret| secret.expose_secret()),
             Some("file-secret")
         );
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_plaintext_channel_when_secure_channels_enforced() {
+        let config = BASE_CONFIG.replace(
+            r#"instance_id = "local""#,
+            r#"instance_id = "local"
+enforce_secure_channels = true"#,
+        );
+        let result = RuntimeConfig::parse(&config);
+        assert!(result.is_err());
+        assert!(result
+            .expect_err("config should fail")
+            .to_string()
+            .contains("plaintext"));
+    }
+
+    #[test]
+    fn accepts_plaintext_channel_with_explicit_exception() {
+        let config = r#"
+[runtime]
+name = "runtime"
+instance_id = "local"
+enforce_secure_channels = true
+
+[store]
+backend = "sqlite"
+url = "sqlite::memory:"
+
+[channels.http-in]
+type = "http"
+mode = "server"
+bind = "127.0.0.1:8080"
+allow_plaintext = true
+
+[[pipeline]]
+name = "demo"
+channel_in = "http-in"
+participants = [{ name = "message-logger" }]
+"#
+        .to_string();
+        assert!(RuntimeConfig::parse(&config).is_ok());
     }
 }

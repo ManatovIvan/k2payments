@@ -9,6 +9,7 @@ use mx20022_channels::{
     ChannelError, ChannelHealth, DeliveryReceipt, InboundChannel, InboundMessage, OutboundChannel,
     OutboundMessage,
 };
+use secrecy::{ExposeSecret, SecretString};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex};
@@ -25,7 +26,7 @@ pub struct TcpInboundConfig {
     pub bind: String,
     pub framing: TcpFraming,
     pub content_type: String,
-    pub auth_token: Option<String>,
+    pub auth_token: Option<SecretString>,
 }
 
 #[derive(Clone)]
@@ -200,13 +201,13 @@ async fn process_connection(
     stream: TcpStream,
     framing: TcpFraming,
     content_type: String,
-    auth_token: Option<String>,
+    auth_token: Option<SecretString>,
     sender: mpsc::Sender<InboundMessage>,
 ) -> Result<(), ChannelError> {
     match framing {
         TcpFraming::LengthPrefixed => {
             let mut stream = stream;
-            if let Some(expected) = auth_token.as_deref() {
+            if let Some(expected) = auth_token.as_ref().map(ExposeSecret::expose_secret) {
                 let auth_frame = read_length_prefixed(&mut stream).await?;
                 let presented = decode_utf8_payload(&auth_frame)?;
                 if !constant_time_eq(presented.trim(), expected) {
@@ -226,7 +227,7 @@ async fn process_connection(
         }
         TcpFraming::Delimiter(delimiter) => {
             let mut reader = BufReader::new(stream);
-            if let Some(expected) = auth_token.as_deref() {
+            if let Some(expected) = auth_token.as_ref().map(ExposeSecret::expose_secret) {
                 let mut auth_buf = Vec::new();
                 let bytes = (&mut reader)
                     .take(MAX_FRAME_SIZE as u64 + 1)

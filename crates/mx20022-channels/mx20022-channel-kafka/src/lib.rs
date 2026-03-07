@@ -21,6 +21,8 @@ pub struct KafkaInboundConfig {
     pub topic: String,
     pub group_id: String,
     pub content_type: String,
+    pub security_protocol: Option<String>,
+    pub ssl_ca_location: Option<String>,
 }
 
 #[derive(Clone)]
@@ -49,11 +51,20 @@ impl InboundChannel for KafkaInboundChannel {
     }
 
     async fn run(&self, sender: mpsc::Sender<InboundMessage>) -> Result<(), ChannelError> {
-        let consumer: StreamConsumer = ClientConfig::new()
+        let mut client_config = ClientConfig::new();
+        client_config
             .set("bootstrap.servers", &self.config.brokers)
             .set("group.id", &self.config.group_id)
             .set("enable.partition.eof", "false")
-            .set("enable.auto.commit", "true")
+            .set("enable.auto.commit", "false");
+        if let Some(protocol) = self.config.security_protocol.as_deref() {
+            client_config.set("security.protocol", protocol);
+        }
+        if let Some(ca_location) = self.config.ssl_ca_location.as_deref() {
+            client_config.set("ssl.ca.location", ca_location);
+        }
+
+        let consumer: StreamConsumer = client_config
             .create()
             .map_err(|e| ChannelError::new(format!("kafka consumer create failed: {e}")))?;
 
@@ -87,6 +98,9 @@ impl InboundChannel for KafkaInboundChannel {
                 })
                 .await
                 .map_err(|e| ChannelError::new(format!("kafka enqueue failed: {e}")))?;
+            consumer
+                .commit_message(&message, rdkafka::consumer::CommitMode::Sync)
+                .map_err(|e| ChannelError::new(format!("kafka commit failed: {e}")))?;
         }
 
         self.connected.store(false, Ordering::Relaxed);
@@ -127,6 +141,8 @@ pub struct KafkaOutboundConfig {
     pub name: String,
     pub brokers: String,
     pub topic: String,
+    pub security_protocol: Option<String>,
+    pub ssl_ca_location: Option<String>,
 }
 
 #[derive(Clone)]
@@ -151,9 +167,18 @@ impl KafkaOutboundChannel {
             return Ok(producer.clone());
         }
 
-        let producer: FutureProducer = ClientConfig::new()
+        let mut client_config = ClientConfig::new();
+        client_config
             .set("bootstrap.servers", &self.config.brokers)
-            .set("message.timeout.ms", "5000")
+            .set("message.timeout.ms", "5000");
+        if let Some(protocol) = self.config.security_protocol.as_deref() {
+            client_config.set("security.protocol", protocol);
+        }
+        if let Some(ca_location) = self.config.ssl_ca_location.as_deref() {
+            client_config.set("ssl.ca.location", ca_location);
+        }
+
+        let producer: FutureProducer = client_config
             .create()
             .map_err(|e| ChannelError::new(format!("kafka producer create failed: {e}")))?;
 
@@ -210,5 +235,55 @@ impl OutboundChannel for KafkaOutboundChannel {
             ok: !self.shutdown.load(Ordering::Relaxed),
             message: Some("ok".to_string()),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        KafkaInboundChannel, KafkaInboundConfig, KafkaOutboundChannel, KafkaOutboundConfig,
+    };
+    use mx20022_channels::{InboundChannel, OutboundChannel, OutboundMessage};
+
+    #[tokio::test]
+    async fn inbound_pause_resume_updates_health_message() {
+        let channel = KafkaInboundChannel::new(KafkaInboundConfig {
+            name: "kafka-in".to_string(),
+            brokers: "127.0.0.1:9092".to_string(),
+            topic: "mx.inbound".to_string(),
+            group_id: "mxruntime".to_string(),
+            content_type: "application/xml".to_string(),
+            security_protocol: None,
+            ssl_ca_location: None,
+        });
+
+        channel.pause().await.expect("pause should succeed");
+        let paused = channel.health().await.expect("health should succeed");
+        assert_eq!(paused.message.as_deref(), Some("paused"));
+
+        channel.resume().await.expect("resume should succeed");
+        let resumed = channel.health().await.expect("health should succeed");
+        assert_eq!(resumed.message.as_deref(), Some("disconnected"));
+    }
+
+    #[tokio::test]
+    async fn outbound_send_fails_after_shutdown() {
+        let channel = KafkaOutboundChannel::new(KafkaOutboundConfig {
+            name: "kafka-out".to_string(),
+            brokers: "127.0.0.1:9092".to_string(),
+            topic: "mx.outbound".to_string(),
+            security_protocol: None,
+            ssl_ca_location: None,
+        });
+        channel.shutdown().await.expect("shutdown should succeed");
+
+        let err = channel
+            .send(OutboundMessage {
+                raw: "<Document/>".to_string(),
+                content_type: "application/xml".to_string(),
+            })
+            .await
+            .expect_err("send should fail once channel is shut down");
+        assert!(err.to_string().contains("shut down"));
     }
 }

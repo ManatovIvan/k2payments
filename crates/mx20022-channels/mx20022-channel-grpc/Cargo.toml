@@ -12,6 +12,7 @@ tokio-stream.workspace = true
 tracing.workspace = true
 tonic.workspace = true
 prost.workspace = true
+secrecy.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true

@@ -26,6 +26,8 @@ pub struct HttpInboundConfig {
     pub content_type: String,
     pub auth: InboundAuthConfig,
     pub cors_allowed_origins: Vec<String>,
+    pub tls_cert_path: Option<String>,
+    pub tls_key_path: Option<String>,
 }
 
 #[derive(Clone)]
@@ -70,14 +72,43 @@ impl InboundChannel for HttpInboundChannel {
             .layer(map_response(add_security_headers))
             .layer(axum::extract::DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
             .with_state(state);
-
-        let listener = tokio::net::TcpListener::bind(&self.config.bind)
-            .await
-            .map_err(|e| ChannelError::new(format!("failed to bind inbound channel: {e}")))?;
-
-        axum::serve(listener, app)
-            .await
-            .map_err(|e| ChannelError::new(format!("inbound channel serve failed: {e}")))
+        match (
+            self.config.tls_cert_path.as_deref(),
+            self.config.tls_key_path.as_deref(),
+        ) {
+            (Some(cert_path), Some(key_path)) => {
+                let socket: std::net::SocketAddr = self.config.bind.parse().map_err(|e| {
+                    ChannelError::new(format!("invalid inbound bind {}: {e}", self.config.bind))
+                })?;
+                let tls = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert_path, key_path)
+                    .await
+                    .map_err(|e| {
+                        ChannelError::new(format!(
+                            "failed to load inbound TLS cert/key for {}: {e}",
+                            self.config.name
+                        ))
+                    })?;
+                tracing::info!(channel = %self.config.name, bind = %self.config.bind, "http inbound channel starting with TLS");
+                axum_server::bind_rustls(socket, tls)
+                    .serve(app.into_make_service())
+                    .await
+                    .map_err(|e| ChannelError::new(format!("inbound channel serve failed: {e}")))
+            }
+            (None, None) => {
+                let listener = tokio::net::TcpListener::bind(&self.config.bind)
+                    .await
+                    .map_err(|e| {
+                        ChannelError::new(format!("failed to bind inbound channel: {e}"))
+                    })?;
+                tracing::warn!(channel = %self.config.name, bind = %self.config.bind, "http inbound channel starting without TLS");
+                axum::serve(listener, app)
+                    .await
+                    .map_err(|e| ChannelError::new(format!("inbound channel serve failed: {e}")))
+            }
+            _ => Err(ChannelError::new(
+                "http inbound TLS requires both tls_cert and tls_key",
+            )),
+        }
     }
 
     async fn shutdown(&self) -> Result<(), ChannelError> {
@@ -268,4 +299,77 @@ fn now_millis() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_else(|_| Duration::from_secs(0))
         .as_millis()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use axum::http::HeaderMap;
+    use axum::http::StatusCode;
+    use axum::routing::post;
+    use axum::{extract::State, Router};
+    use mx20022_channels::auth::InboundAuthConfig;
+    use mx20022_channels::{OutboundChannel, OutboundMessage};
+    use tokio::sync::{mpsc, RwLock};
+
+    use super::{handle_post, HttpOutboundChannel, HttpOutboundConfig, InboundState};
+
+    #[tokio::test]
+    async fn inbound_handler_enqueues_message() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let state = InboundState {
+            sender: tx,
+            content_type: "application/xml".to_string(),
+            paused: Arc::new(RwLock::new(false)),
+            auth: InboundAuthConfig::default(),
+        };
+
+        let (status, _) = handle_post(State(state), HeaderMap::new(), "<Document/>".into()).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+
+        let queued = rx.recv().await.expect("message should be queued");
+        assert_eq!(queued.raw, "<Document/>");
+        assert_eq!(queued.content_type, "application/xml");
+    }
+
+    #[tokio::test]
+    async fn outbound_channel_posts_payload() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("resolve local addr");
+        let (tx, mut rx) = mpsc::channel::<String>(1);
+        let app = Router::new()
+            .route(
+                "/",
+                post(
+                    |State(sender): State<mpsc::Sender<String>>, body: String| async move {
+                        let _ = sender.send(body).await;
+                        StatusCode::OK
+                    },
+                ),
+            )
+            .with_state(tx);
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let channel = HttpOutboundChannel::new(HttpOutboundConfig {
+            name: "http-out".to_string(),
+            endpoint: format!("http://{addr}/"),
+            content_type: "application/xml".to_string(),
+        });
+
+        channel
+            .send(OutboundMessage {
+                raw: "<Document/>".to_string(),
+                content_type: String::new(),
+            })
+            .await
+            .expect("outbound send should succeed");
+
+        let posted = rx.recv().await.expect("server should receive payload");
+        assert_eq!(posted, "<Document/>");
+    }
 }

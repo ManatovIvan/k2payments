@@ -11,4 +11,5 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 jsonwebtoken = "9"
+secrecy.workspace = true
 subtle.workspace = true

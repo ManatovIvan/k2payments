@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 
 use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
+use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use subtle::ConstantTimeEq;
 
@@ -16,8 +17,8 @@ pub enum InboundAuthMode {
 #[derive(Clone)]
 pub struct InboundAuthConfig {
     pub mode: InboundAuthMode,
-    pub bearer_token: Option<String>,
-    pub jwt_hs256_secret: Option<String>,
+    pub bearer_token: Option<SecretString>,
+    pub jwt_hs256_secret: Option<SecretString>,
     pub jwt_issuer: Option<String>,
     pub jwt_audience: Option<String>,
     pub required_roles: Vec<String>,
@@ -93,7 +94,8 @@ pub fn authorize_inbound(
                 .ok_or_else(|| ChannelError::new("missing bearer token"))?;
             let expected = config
                 .bearer_token
-                .as_deref()
+                .as_ref()
+                .map(ExposeSecret::expose_secret)
                 .ok_or_else(|| ChannelError::new("inbound auth is misconfigured"))?;
             if constant_time_eq(token, expected) {
                 Ok(())
@@ -113,7 +115,8 @@ fn authorize_inbound_jwt(
         .ok_or_else(|| ChannelError::new("missing bearer token"))?;
     let secret = config
         .jwt_hs256_secret
-        .as_deref()
+        .as_ref()
+        .map(ExposeSecret::expose_secret)
         .ok_or_else(|| ChannelError::new("inbound auth is misconfigured"))?;
 
     let mut validation = Validation::new(Algorithm::HS256);
@@ -214,6 +217,7 @@ pub fn constant_time_eq(left: &str, right: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use jsonwebtoken::{encode, EncodingKey, Header};
+    use secrecy::SecretString;
     use serde::Serialize;
 
     use super::{
@@ -231,7 +235,7 @@ mod tests {
     fn static_bearer_passes_and_fails() {
         let cfg = InboundAuthConfig {
             mode: InboundAuthMode::StaticBearer,
-            bearer_token: Some("secret".to_string()),
+            bearer_token: Some(SecretString::new("secret".into())),
             ..InboundAuthConfig::default()
         };
 
@@ -263,7 +267,7 @@ mod tests {
     fn jwt_requires_role_when_configured() {
         let cfg = InboundAuthConfig {
             mode: InboundAuthMode::JwtHs256,
-            jwt_hs256_secret: Some("secret".to_string()),
+            jwt_hs256_secret: Some(SecretString::new("secret".into())),
             required_roles: vec!["channel.ingress".to_string()],
             ..InboundAuthConfig::default()
         };

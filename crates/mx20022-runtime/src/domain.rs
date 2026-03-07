@@ -1,42 +1,64 @@
 use std::collections::HashMap;
+use std::time::SystemTime;
+
+use mx20022_store::TransactionRecord;
 
 #[derive(Debug, Clone)]
 pub struct TransactionRequest {
-    pub tx_id: String,
-    pub pipeline: String,
-    pub source_channel: String,
-    pub message_type: String,
-    pub raw_message: String,
-    pub key_fields: HashMap<String, String>,
+    pub record: TransactionRecord,
 }
 
 impl TransactionRequest {
+    pub fn new(
+        tx_id: String,
+        pipeline: String,
+        source_channel: String,
+        message_type: String,
+        raw_message: String,
+        key_fields: HashMap<String, String>,
+        received_at: SystemTime,
+    ) -> Self {
+        Self {
+            record: TransactionRecord {
+                tx_id,
+                pipeline,
+                source_channel,
+                message_type,
+                raw_message,
+                state: "RECEIVED".to_string(),
+                received_at,
+                completed_at: None,
+                key_fields,
+            },
+        }
+    }
+
     pub fn validate(&self) -> Result<(), DomainError> {
-        if self.tx_id.trim().is_empty() {
+        if self.record.tx_id.trim().is_empty() {
             return Err(DomainError::Validation(
                 "tx_id must not be empty".to_string(),
             ));
         }
 
-        if self.pipeline.trim().is_empty() {
+        if self.record.pipeline.trim().is_empty() {
             return Err(DomainError::Validation(
                 "pipeline must not be empty".to_string(),
             ));
         }
 
-        if self.source_channel.trim().is_empty() {
+        if self.record.source_channel.trim().is_empty() {
             return Err(DomainError::Validation(
                 "source_channel must not be empty".to_string(),
             ));
         }
 
-        if self.message_type.trim().is_empty() {
+        if self.record.message_type.trim().is_empty() {
             return Err(DomainError::Validation(
                 "message_type must not be empty".to_string(),
             ));
         }
 
-        if self.raw_message.trim().is_empty() {
+        if self.record.raw_message.trim().is_empty() {
             return Err(DomainError::Validation(
                 "raw_message must not be empty".to_string(),
             ));
@@ -55,18 +77,20 @@ pub enum DomainError {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::time::SystemTime;
 
     use super::{DomainError, TransactionRequest};
 
     fn request() -> TransactionRequest {
-        TransactionRequest {
-            tx_id: "TX-1".to_string(),
-            pipeline: "demo".to_string(),
-            source_channel: "http-in".to_string(),
-            message_type: "pacs.008".to_string(),
-            raw_message: "<Document/>".to_string(),
-            key_fields: HashMap::new(),
-        }
+        TransactionRequest::new(
+            "TX-1".to_string(),
+            "demo".to_string(),
+            "http-in".to_string(),
+            "pacs.008".to_string(),
+            "<Document/>".to_string(),
+            HashMap::new(),
+            SystemTime::now(),
+        )
     }
 
     #[test]
@@ -77,35 +101,35 @@ mod tests {
     #[test]
     fn rejects_empty_required_fields() {
         let mut invalid = request();
-        invalid.tx_id = " ".to_string();
+        invalid.record.tx_id = " ".to_string();
         assert!(matches!(
             invalid.validate(),
             Err(DomainError::Validation(_))
         ));
 
         invalid = request();
-        invalid.pipeline = " ".to_string();
+        invalid.record.pipeline = " ".to_string();
         assert!(matches!(
             invalid.validate(),
             Err(DomainError::Validation(_))
         ));
 
         invalid = request();
-        invalid.source_channel = " ".to_string();
+        invalid.record.source_channel = " ".to_string();
         assert!(matches!(
             invalid.validate(),
             Err(DomainError::Validation(_))
         ));
 
         invalid = request();
-        invalid.message_type = " ".to_string();
+        invalid.record.message_type = " ".to_string();
         assert!(matches!(
             invalid.validate(),
             Err(DomainError::Validation(_))
         ));
 
         invalid = request();
-        invalid.raw_message = " ".to_string();
+        invalid.record.raw_message = " ".to_string();
         assert!(matches!(
             invalid.validate(),
             Err(DomainError::Validation(_))

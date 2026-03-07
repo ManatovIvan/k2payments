@@ -254,39 +254,38 @@ impl RuntimeApp {
             .cloned()
             .ok_or_else(|| RuntimeBuildError::UnknownPipeline(pipeline.to_string()))?;
 
-        let request = TransactionRequest {
-            tx_id: tx_id.into(),
-            pipeline: pipeline.to_string(),
-            source_channel: source_channel.into(),
-            message_type: message_type.into(),
-            raw_message: raw_message.into(),
-            key_fields: HashMap::new(),
-        };
+        let now = SystemTime::now();
+        let request = TransactionRequest::new(
+            tx_id.into(),
+            pipeline.to_string(),
+            source_channel.into(),
+            message_type.into(),
+            raw_message.into(),
+            HashMap::new(),
+            now,
+        );
         request.validate()?;
+        let tx = &request.record;
 
-        if !self
-            .accepts_message_type(pipeline, &request.message_type)
-            .await
-        {
+        if !self.accepts_message_type(pipeline, &tx.message_type).await {
             return Err(RuntimeBuildError::MessageTypeNotAccepted {
                 pipeline: pipeline.to_string(),
-                message_type: request.message_type.clone(),
+                message_type: tx.message_type.clone(),
             });
         }
 
-        let now = SystemTime::now();
         let _active_guard = ActiveTransactionGuard::new(pipeline.to_string());
         let mut ctx = Context::new(ContextMeta {
-            transaction_id: request.tx_id.clone(),
-            received_at: now,
-            pipeline: pipeline.to_string(),
-            source_channel: request.source_channel.clone(),
-            message_type: request.message_type.clone(),
-            raw_message: request.raw_message.clone(),
+            transaction_id: tx.tx_id.clone(),
+            received_at: tx.received_at,
+            pipeline: tx.pipeline.clone(),
+            source_channel: tx.source_channel.clone(),
+            message_type: tx.message_type.clone(),
+            raw_message: tx.raw_message.clone(),
         });
 
         self.store
-            .begin_transaction(&TransactionUseCase::begin_record(&request, now))
+            .begin_transaction(tx)
             .await
             .map_err(RuntimeBuildError::Store)?;
 
@@ -300,13 +299,13 @@ impl RuntimeApp {
                 match timed {
                     Ok(result) => result.map_err(RuntimeBuildError::Processing)?,
                     Err(_) => {
-                        let context_entries = context_entries_for_tx(&request.tx_id, &ctx);
+                        let context_entries = context_entries_for_tx(&tx.tx_id, &ctx);
                         self.store
-                            .batch_append_context_entries(&request.tx_id, &context_entries)
+                            .batch_append_context_entries(&tx.tx_id, &context_entries)
                             .await
                             .map_err(RuntimeBuildError::Store)?;
                         self.store
-                            .complete_transaction(&request.tx_id, mx20022_store::Outcome::Poison)
+                            .complete_transaction(&tx.tx_id, mx20022_store::Outcome::Poison)
                             .await
                             .map_err(RuntimeBuildError::Store)?;
                         let duration_seconds = started
@@ -315,12 +314,12 @@ impl RuntimeApp {
                             .as_secs_f64();
                         mx20022_metrics::record_transaction_duration(
                             pipeline,
-                            &request.message_type,
+                            &tx.message_type,
                             duration_seconds,
                         );
                         mx20022_metrics::record_transaction_total(
                             pipeline,
-                            &request.message_type,
+                            &tx.message_type,
                             "poison",
                         );
                         return Err(RuntimeBuildError::PipelineTimeout {
@@ -357,7 +356,7 @@ impl RuntimeApp {
                     }
                 } else {
                     tracing::warn!(
-                        tx_id = %request.tx_id,
+                        tx_id = %tx.tx_id,
                         pipeline = %pipeline,
                         channel_out = ?runtime.channel_out,
                         "committed transaction has channel_out configured but no response.xml in context"
@@ -366,24 +365,21 @@ impl RuntimeApp {
             }
         }
 
-        let context_entries = context_entries_for_tx(&request.tx_id, &ctx);
+        let context_entries = context_entries_for_tx(&tx.tx_id, &ctx);
         self.store
-            .batch_append_context_entries(&request.tx_id, &context_entries)
+            .batch_append_context_entries(&tx.tx_id, &context_entries)
             .await
             .map_err(RuntimeBuildError::Store)?;
 
         self.store
-            .complete_transaction(
-                &request.tx_id,
-                TransactionUseCase::map_outcome(report.outcome),
-            )
+            .complete_transaction(&tx.tx_id, TransactionUseCase::map_outcome(report.outcome))
             .await
             .map_err(RuntimeBuildError::Store)?;
 
         if report.outcome == mx20022_runtime_core::transaction_manager::Outcome::Committed {
             if let Some(key) = ctx.get_or_none::<CorrelationLookupKey>("correlation.lookup_key") {
                 self.correlation
-                    .match_response(key.clone(), request.tx_id.clone())
+                    .match_response(key.clone(), tx.tx_id.clone())
                     .await
                     .map_err(RuntimeBuildError::Correlation)?;
             }
@@ -401,14 +397,10 @@ impl RuntimeApp {
             .elapsed()
             .unwrap_or_else(|_| Duration::from_secs(0))
             .as_secs_f64();
-        mx20022_metrics::record_transaction_duration(
-            pipeline,
-            &request.message_type,
-            duration_seconds,
-        );
+        mx20022_metrics::record_transaction_duration(pipeline, &tx.message_type, duration_seconds);
         mx20022_metrics::record_transaction_total(
             pipeline,
-            &request.message_type,
+            &tx.message_type,
             match report.outcome {
                 mx20022_runtime_core::transaction_manager::Outcome::Committed => "committed",
                 mx20022_runtime_core::transaction_manager::Outcome::Aborted => "aborted",
@@ -455,13 +447,16 @@ impl RuntimeApp {
 
             for record in result.records {
                 report.attempted += 1;
+                let tx_id = record.tx_id.clone();
+                let pipeline = record.pipeline.clone();
+                let state = record.state.clone();
                 let recovery = self
                     .process(
-                        &record.pipeline,
-                        record.tx_id.clone(),
-                        record.source_channel.clone(),
-                        record.message_type.clone(),
-                        record.raw_message.clone(),
+                        &pipeline,
+                        tx_id.clone(),
+                        record.source_channel,
+                        record.message_type,
+                        record.raw_message,
                     )
                     .await;
 
@@ -470,9 +465,9 @@ impl RuntimeApp {
                     Err(error) => {
                         report.failed += 1;
                         tracing::error!(
-                            tx_id = %record.tx_id,
-                            pipeline = %record.pipeline,
-                            state = %record.state,
+                            tx_id = %tx_id,
+                            pipeline = %pipeline,
+                            state = %state,
                             error = %error,
                             "startup recovery replay failed"
                         );
@@ -611,6 +606,7 @@ fn build_outbound_channel(
             name: channel_name.to_string(),
             endpoint: extract_required(channel_cfg, "endpoint")
                 .or_else(|_| extract_required(channel_cfg, "url"))?,
+            tls_ca_cert_path: extract_optional(channel_cfg, "tls_ca_cert"),
         }))),
         #[cfg(feature = "channel-tcp")]
         ("tcp", "client") => Ok(Arc::new(TcpOutboundChannel::new(TcpOutboundConfig {
@@ -645,6 +641,9 @@ fn build_outbound_channel(
                     ))
                 })?,
             topic: extract_required(channel_cfg, "topic")?,
+            security_protocol: extract_optional(channel_cfg, "security_protocol"),
+            ssl_ca_location: extract_optional(channel_cfg, "ssl_ca_location")
+                .or_else(|| extract_optional(channel_cfg, "tls_ca_cert")),
         }))),
         #[cfg(feature = "channel-amqp")]
         ("amqp", "publisher") => Ok(Arc::new(AmqpOutboundChannel::new(AmqpOutboundConfig {
@@ -725,209 +724,291 @@ fn build_participants(
     configs: &[ParticipantConfig],
     store: Arc<dyn Store>,
 ) -> Result<Vec<Arc<dyn Participant>>, RuntimeBuildError> {
-    let mut participants: Vec<Arc<dyn Participant>> = Vec::new();
+    let registry = ParticipantRegistry::with_defaults();
+    configs
+        .iter()
+        .map(|cfg| registry.build(cfg, Arc::clone(&store)))
+        .collect()
+}
 
-    for cfg in configs {
-        match cfg.name.as_str() {
-            "message-logger" => {
-                let mut participant = MessageLogger::new();
-                if let Some(tag) = cfg.config.get("tag").and_then(|v| v.as_str()) {
-                    participant = participant.with_tag(tag.to_string());
-                }
-                participants.push(Arc::new(participant));
-            }
-            "schema-validator" => participants.push(Arc::new(SchemaValidator::new())),
-            "fednow-rule-validator" => participants.push(Arc::new(FednowRuleValidator::new())),
-            "sepa-rule-validator" => participants.push(Arc::new(SepaRuleValidator::new())),
-            "cbpr-rule-validator" => participants.push(Arc::new(CbprRuleValidator::new())),
-            "business-rule-validator" => {
-                let mut validator = BusinessRuleValidator::new();
-                if let Some(scheme) = cfg.config.get("scheme").and_then(|v| v.as_str()) {
-                    validator = validator.with_scheme(match scheme {
-                        "fednow" => {
-                            mx20022_participants::business_rule_validator::ValidationScheme::FedNow
-                        }
-                        "sepa" => {
-                            mx20022_participants::business_rule_validator::ValidationScheme::Sepa
-                        }
-                        "cbpr" => {
-                            mx20022_participants::business_rule_validator::ValidationScheme::Cbpr
-                        }
-                        other => {
-                            return Err(RuntimeBuildError::UnknownParticipant(format!(
-                                "business-rule-validator scheme `{other}`"
-                            )));
-                        }
-                    });
-                }
-                participants.push(Arc::new(validator));
-            }
-            "status-response-builder" => {
-                let auto = cfg
-                    .config
-                    .get("auto_pacs002")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(true);
-                participants.push(Arc::new(StatusResponseBuilder::new(auto)));
-            }
-            "acknowledgement-builder" => {
-                let overwrite = cfg
-                    .config
-                    .get("overwrite_existing")
-                    .and_then(|value| value.as_bool())
-                    .unwrap_or(false);
-                participants.push(Arc::new(AcknowledgementBuilder::new(overwrite)));
-            }
-            "error-response-builder" => {
-                let overwrite = cfg
-                    .config
-                    .get("overwrite_existing")
-                    .and_then(|value| value.as_bool())
-                    .unwrap_or(false);
-                participants.push(Arc::new(ErrorResponseBuilder::new(overwrite)));
-            }
-            "duplicate-checker" => {
-                let keys = cfg
-                    .config
-                    .get("keys")
-                    .and_then(|value| value.as_array())
-                    .map(|items| {
-                        items
-                            .iter()
-                            .filter_map(|item| item.as_str())
-                            .map(|item| match item {
-                                "message_id" | "msg_id" => Ok(DuplicateKey::MessageId),
-                                "end_to_end_id" | "e2e_id" => Ok(DuplicateKey::EndToEndId),
-                                "uetr" => Ok(DuplicateKey::Uetr),
-                                other => Err(RuntimeBuildError::UnknownParticipant(format!(
-                                    "duplicate-checker key `{other}`"
-                                ))),
-                            })
-                            .collect::<Result<Vec<_>, _>>()
-                    })
-                    .transpose()?
-                    .unwrap_or_else(|| {
-                        vec![
-                            DuplicateKey::MessageId,
-                            DuplicateKey::EndToEndId,
-                            DuplicateKey::Uetr,
-                        ]
-                    });
-                participants.push(Arc::new(
-                    DuplicateChecker::new(Arc::clone(&store)).with_keys(keys),
-                ));
-            }
-            "routing-engine" => {
-                let default_route = cfg
-                    .config
-                    .get("default_route")
-                    .and_then(|value| value.as_str())
-                    .map(ToString::to_string);
-                let mut engine = RoutingEngine::new(default_route);
+type ParticipantBuilderFn =
+    fn(&ParticipantConfig, Arc<dyn Store>) -> Result<Arc<dyn Participant>, RuntimeBuildError>;
 
-                if let Some(rules) = cfg.config.get("rules").and_then(|value| value.as_array()) {
-                    for rule in rules {
-                        let table = rule.as_table().ok_or_else(|| {
-                            RuntimeBuildError::UnknownParticipant(
-                                "routing-engine rule must be an inline table".to_string(),
-                            )
-                        })?;
-                        let destination = table
-                            .get("destination")
-                            .and_then(|value| value.as_str())
-                            .ok_or_else(|| {
-                                RuntimeBuildError::UnknownParticipant(
-                                    "routing-engine rule requires destination".to_string(),
-                                )
-                            })?
-                            .to_string();
-                        engine = engine.with_rule(RouteRule {
-                            destination,
-                            message_type: table
-                                .get("message_type")
-                                .and_then(|value| value.as_str())
-                                .map(ToString::to_string),
-                            currency: table
-                                .get("currency")
-                                .and_then(|value| value.as_str())
-                                .map(ToString::to_string),
-                            bic_prefix: table
-                                .get("bic_prefix")
-                                .and_then(|value| value.as_str())
-                                .map(ToString::to_string),
-                        });
-                    }
-                }
+#[derive(Default)]
+struct ParticipantRegistry {
+    builders: HashMap<&'static str, ParticipantBuilderFn>,
+}
 
-                participants.push(Arc::new(engine));
-            }
-            "rate-limiter" => {
-                let rate = cfg
-                    .config
-                    .get("rate_per_second")
-                    .and_then(|value| value.as_float())
-                    .or_else(|| {
-                        cfg.config
-                            .get("rate_per_second")
-                            .and_then(|value| value.as_integer().map(|v| v as f64))
-                    })
-                    .unwrap_or(100.0);
-                let burst = cfg
-                    .config
-                    .get("burst")
-                    .and_then(|value| value.as_float())
-                    .or_else(|| {
-                        cfg.config
-                            .get("burst")
-                            .and_then(|value| value.as_integer().map(|v| v as f64))
-                    })
-                    .unwrap_or(rate.max(1.0));
-                let scope = match cfg
-                    .config
-                    .get("scope")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or("global")
-                {
-                    "global" => LimitScope::Global,
-                    "message_type" => LimitScope::MessageType,
-                    "source_channel" => LimitScope::SourceChannel,
-                    other => {
-                        return Err(RuntimeBuildError::UnknownParticipant(format!(
-                            "rate-limiter scope `{other}`"
-                        )))
-                    }
-                };
-                participants.push(Arc::new(RateLimiter::new(
-                    rate.max(0.1),
-                    burst.max(1.0),
-                    scope,
-                )));
-            }
-            "circuit-breaker" => {
-                let threshold = cfg
-                    .config
-                    .get("failure_threshold")
-                    .and_then(|value| value.as_integer())
-                    .and_then(|value| u32::try_from(value).ok())
-                    .unwrap_or(5);
-                let open_ms = cfg
-                    .config
-                    .get("open_ms")
-                    .and_then(|value| value.as_integer())
-                    .and_then(|value| u64::try_from(value).ok())
-                    .unwrap_or(30_000);
-                participants.push(Arc::new(CircuitBreaker::new(
-                    threshold,
-                    Duration::from_millis(open_ms),
-                )));
-            }
+impl ParticipantRegistry {
+    fn with_defaults() -> Self {
+        let mut registry = Self::default();
+        registry.register("message-logger", build_message_logger);
+        registry.register("schema-validator", build_schema_validator);
+        registry.register("fednow-rule-validator", build_fednow_rule_validator);
+        registry.register("sepa-rule-validator", build_sepa_rule_validator);
+        registry.register("cbpr-rule-validator", build_cbpr_rule_validator);
+        registry.register("business-rule-validator", build_business_rule_validator);
+        registry.register("status-response-builder", build_status_response_builder);
+        registry.register("acknowledgement-builder", build_acknowledgement_builder);
+        registry.register("error-response-builder", build_error_response_builder);
+        registry.register("duplicate-checker", build_duplicate_checker);
+        registry.register("routing-engine", build_routing_engine);
+        registry.register("rate-limiter", build_rate_limiter);
+        registry.register("circuit-breaker", build_circuit_breaker);
+        registry
+    }
+
+    fn register(&mut self, name: &'static str, builder: ParticipantBuilderFn) {
+        self.builders.insert(name, builder);
+    }
+
+    fn build(
+        &self,
+        cfg: &ParticipantConfig,
+        store: Arc<dyn Store>,
+    ) -> Result<Arc<dyn Participant>, RuntimeBuildError> {
+        let Some(builder) = self.builders.get(cfg.name.as_str()) else {
+            return Err(RuntimeBuildError::UnknownParticipant(cfg.name.clone()));
+        };
+        builder(cfg, store)
+    }
+}
+
+fn build_message_logger(
+    cfg: &ParticipantConfig,
+    _store: Arc<dyn Store>,
+) -> Result<Arc<dyn Participant>, RuntimeBuildError> {
+    let mut participant = MessageLogger::new();
+    if let Some(tag) = cfg.config.get("tag").and_then(|v| v.as_str()) {
+        participant = participant.with_tag(tag.to_string());
+    }
+    Ok(Arc::new(participant))
+}
+
+fn build_schema_validator(
+    _cfg: &ParticipantConfig,
+    _store: Arc<dyn Store>,
+) -> Result<Arc<dyn Participant>, RuntimeBuildError> {
+    Ok(Arc::new(SchemaValidator::new()))
+}
+
+fn build_fednow_rule_validator(
+    _cfg: &ParticipantConfig,
+    _store: Arc<dyn Store>,
+) -> Result<Arc<dyn Participant>, RuntimeBuildError> {
+    Ok(Arc::new(FednowRuleValidator::new()))
+}
+
+fn build_sepa_rule_validator(
+    _cfg: &ParticipantConfig,
+    _store: Arc<dyn Store>,
+) -> Result<Arc<dyn Participant>, RuntimeBuildError> {
+    Ok(Arc::new(SepaRuleValidator::new()))
+}
+
+fn build_cbpr_rule_validator(
+    _cfg: &ParticipantConfig,
+    _store: Arc<dyn Store>,
+) -> Result<Arc<dyn Participant>, RuntimeBuildError> {
+    Ok(Arc::new(CbprRuleValidator::new()))
+}
+
+fn build_business_rule_validator(
+    cfg: &ParticipantConfig,
+    _store: Arc<dyn Store>,
+) -> Result<Arc<dyn Participant>, RuntimeBuildError> {
+    let mut validator = BusinessRuleValidator::new();
+    if let Some(scheme) = cfg.config.get("scheme").and_then(|v| v.as_str()) {
+        validator = validator.with_scheme(match scheme {
+            "fednow" => mx20022_participants::business_rule_validator::ValidationScheme::FedNow,
+            "sepa" => mx20022_participants::business_rule_validator::ValidationScheme::Sepa,
+            "cbpr" => mx20022_participants::business_rule_validator::ValidationScheme::Cbpr,
             other => {
-                return Err(RuntimeBuildError::UnknownParticipant(other.to_string()));
+                return Err(RuntimeBuildError::UnknownParticipant(format!(
+                    "business-rule-validator scheme `{other}`"
+                )));
             }
+        });
+    }
+    Ok(Arc::new(validator))
+}
+
+fn build_status_response_builder(
+    cfg: &ParticipantConfig,
+    _store: Arc<dyn Store>,
+) -> Result<Arc<dyn Participant>, RuntimeBuildError> {
+    let auto = cfg
+        .config
+        .get("auto_pacs002")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    Ok(Arc::new(StatusResponseBuilder::new(auto)))
+}
+
+fn build_acknowledgement_builder(
+    cfg: &ParticipantConfig,
+    _store: Arc<dyn Store>,
+) -> Result<Arc<dyn Participant>, RuntimeBuildError> {
+    let overwrite = cfg
+        .config
+        .get("overwrite_existing")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    Ok(Arc::new(AcknowledgementBuilder::new(overwrite)))
+}
+
+fn build_error_response_builder(
+    cfg: &ParticipantConfig,
+    _store: Arc<dyn Store>,
+) -> Result<Arc<dyn Participant>, RuntimeBuildError> {
+    let overwrite = cfg
+        .config
+        .get("overwrite_existing")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    Ok(Arc::new(ErrorResponseBuilder::new(overwrite)))
+}
+
+fn build_duplicate_checker(
+    cfg: &ParticipantConfig,
+    store: Arc<dyn Store>,
+) -> Result<Arc<dyn Participant>, RuntimeBuildError> {
+    let keys = cfg
+        .config
+        .get("keys")
+        .and_then(|value| value.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str())
+                .map(|item| match item {
+                    "message_id" | "msg_id" => Ok(DuplicateKey::MessageId),
+                    "end_to_end_id" | "e2e_id" => Ok(DuplicateKey::EndToEndId),
+                    "uetr" => Ok(DuplicateKey::Uetr),
+                    other => Err(RuntimeBuildError::UnknownParticipant(format!(
+                        "duplicate-checker key `{other}`"
+                    ))),
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?
+        .unwrap_or_else(|| {
+            vec![
+                DuplicateKey::MessageId,
+                DuplicateKey::EndToEndId,
+                DuplicateKey::Uetr,
+            ]
+        });
+    Ok(Arc::new(DuplicateChecker::new(store).with_keys(keys)))
+}
+
+fn build_routing_engine(
+    cfg: &ParticipantConfig,
+    _store: Arc<dyn Store>,
+) -> Result<Arc<dyn Participant>, RuntimeBuildError> {
+    let default_route = cfg
+        .config
+        .get("default_route")
+        .and_then(|value| value.as_str())
+        .map(ToString::to_string);
+    let mut engine = RoutingEngine::new(default_route);
+
+    if let Some(rules) = cfg.config.get("rules").and_then(|value| value.as_array()) {
+        for rule in rules {
+            let table = rule.as_table().ok_or_else(|| {
+                RuntimeBuildError::UnknownParticipant(
+                    "routing-engine rule must be an inline table".to_string(),
+                )
+            })?;
+            let destination = table
+                .get("destination")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| {
+                    RuntimeBuildError::UnknownParticipant(
+                        "routing-engine rule requires destination".to_string(),
+                    )
+                })?
+                .to_string();
+            engine = engine.with_rule(RouteRule {
+                destination,
+                message_type: table
+                    .get("message_type")
+                    .and_then(|value| value.as_str())
+                    .map(ToString::to_string),
+                currency: table
+                    .get("currency")
+                    .and_then(|value| value.as_str())
+                    .map(ToString::to_string),
+                bic_prefix: table
+                    .get("bic_prefix")
+                    .and_then(|value| value.as_str())
+                    .map(ToString::to_string),
+            });
         }
     }
 
-    Ok(participants)
+    Ok(Arc::new(engine))
+}
+
+fn build_rate_limiter(
+    cfg: &ParticipantConfig,
+    _store: Arc<dyn Store>,
+) -> Result<Arc<dyn Participant>, RuntimeBuildError> {
+    let rate = read_f64(cfg, "rate_per_second").unwrap_or(100.0);
+    let burst = read_f64(cfg, "burst").unwrap_or(rate.max(1.0));
+    let scope = match cfg
+        .config
+        .get("scope")
+        .and_then(|value| value.as_str())
+        .unwrap_or("global")
+    {
+        "global" => LimitScope::Global,
+        "message_type" => LimitScope::MessageType,
+        "source_channel" => LimitScope::SourceChannel,
+        other => {
+            return Err(RuntimeBuildError::UnknownParticipant(format!(
+                "rate-limiter scope `{other}`"
+            )))
+        }
+    };
+    Ok(Arc::new(RateLimiter::new(
+        rate.max(0.1),
+        burst.max(1.0),
+        scope,
+    )))
+}
+
+fn build_circuit_breaker(
+    cfg: &ParticipantConfig,
+    _store: Arc<dyn Store>,
+) -> Result<Arc<dyn Participant>, RuntimeBuildError> {
+    let threshold = cfg
+        .config
+        .get("failure_threshold")
+        .and_then(|value| value.as_integer())
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or(5);
+    let open_ms = cfg
+        .config
+        .get("open_ms")
+        .and_then(|value| value.as_integer())
+        .and_then(|value| u64::try_from(value).ok())
+        .unwrap_or(30_000);
+    Ok(Arc::new(CircuitBreaker::new(
+        threshold,
+        Duration::from_millis(open_ms),
+    )))
+}
+
+fn read_f64(cfg: &ParticipantConfig, key: &str) -> Option<f64> {
+    cfg.config
+        .get(key)
+        .and_then(|value| value.as_float())
+        .or_else(|| {
+            cfg.config
+                .get(key)
+                .and_then(|value| value.as_integer().map(|v| v as f64))
+        })
 }
 
 #[derive(Debug, thiserror::Error)]

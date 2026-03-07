@@ -1,6 +1,9 @@
+use std::sync::OnceLock;
+
 use crate::auth::{authorize_request, AdminResource, AuthConfig, AuthError};
 use crate::controller::{AdminController, AdminControllerError};
 use crate::middleware::{MiddlewareStage, DEFAULT_MIDDLEWARE_CHAIN};
+use crate::rate_limit::AdminRateLimiter;
 use crate::routes::HttpMethod;
 
 #[derive(Debug, Clone)]
@@ -103,7 +106,15 @@ fn run_middleware(request: &HttpRequest, auth: &AuthConfig) -> Result<(), HttpRe
                 }
             }
             MiddlewareStage::Authorization => {}
-            MiddlewareStage::RateLimit => {}
+            MiddlewareStage::RateLimit => {
+                let key = rate_limit_key(request);
+                if !global_rate_limiter().allow(&key) {
+                    return Err(HttpResponse {
+                        status: 429,
+                        body: "{\"error\":\"rate limit exceeded\"}".to_string(),
+                    });
+                }
+            }
             MiddlewareStage::Validation => {
                 if request.path.trim().is_empty() {
                     return Err(HttpResponse {
@@ -129,6 +140,20 @@ fn map_auth_error(error: AuthError) -> HttpResponse {
         status,
         body: format!("{{\"error\":\"{}\"}}", error),
     }
+}
+
+fn global_rate_limiter() -> &'static AdminRateLimiter {
+    static RATE_LIMITER: OnceLock<AdminRateLimiter> = OnceLock::new();
+    RATE_LIMITER.get_or_init(AdminRateLimiter::default)
+}
+
+fn rate_limit_key(request: &HttpRequest) -> String {
+    request
+        .mtls_subject
+        .as_deref()
+        .or(request.bearer_token.as_deref())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| "anonymous".to_string())
 }
 
 fn map_controller_error(error: AdminControllerError) -> HttpResponse {

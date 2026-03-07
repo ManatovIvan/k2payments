@@ -193,3 +193,47 @@ impl OutboundChannel for NatsOutboundChannel {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{NatsInboundChannel, NatsInboundConfig, NatsOutboundChannel, NatsOutboundConfig};
+    use mx20022_channels::{InboundChannel, OutboundChannel, OutboundMessage};
+
+    #[tokio::test]
+    async fn inbound_pause_resume_updates_health_message() {
+        let channel = NatsInboundChannel::new(NatsInboundConfig {
+            name: "nats-in".to_string(),
+            endpoint: "nats://127.0.0.1:4222".to_string(),
+            subject: "mx.inbound".to_string(),
+            queue_group: None,
+            content_type: "application/xml".to_string(),
+        });
+
+        channel.pause().await.expect("pause should succeed");
+        let paused = channel.health().await.expect("health should succeed");
+        assert_eq!(paused.message.as_deref(), Some("paused"));
+
+        channel.resume().await.expect("resume should succeed");
+        let resumed = channel.health().await.expect("health should succeed");
+        assert_eq!(resumed.message.as_deref(), Some("disconnected"));
+    }
+
+    #[tokio::test]
+    async fn outbound_send_fails_after_shutdown() {
+        let channel = NatsOutboundChannel::new(NatsOutboundConfig {
+            name: "nats-out".to_string(),
+            endpoint: "nats://127.0.0.1:4222".to_string(),
+            subject: "mx.outbound".to_string(),
+        });
+        channel.shutdown().await.expect("shutdown should succeed");
+
+        let err = channel
+            .send(OutboundMessage {
+                raw: "<Document/>".to_string(),
+                content_type: "application/xml".to_string(),
+            })
+            .await
+            .expect_err("send should fail once channel is shut down");
+        assert!(err.to_string().contains("shut down"));
+    }
+}

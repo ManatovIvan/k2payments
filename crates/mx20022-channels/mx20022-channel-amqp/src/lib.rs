@@ -230,3 +230,48 @@ impl OutboundChannel for AmqpOutboundChannel {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{AmqpInboundChannel, AmqpInboundConfig, AmqpOutboundChannel, AmqpOutboundConfig};
+    use mx20022_channels::{InboundChannel, OutboundChannel, OutboundMessage};
+
+    #[tokio::test]
+    async fn inbound_pause_resume_updates_health_message() {
+        let channel = AmqpInboundChannel::new(AmqpInboundConfig {
+            name: "amqp-in".to_string(),
+            url: "amqp://127.0.0.1:5672/%2f".to_string(),
+            queue: "mx.inbound".to_string(),
+            consumer_tag: "mxruntime".to_string(),
+            content_type: "application/xml".to_string(),
+        });
+
+        channel.pause().await.expect("pause should succeed");
+        let paused = channel.health().await.expect("health should succeed");
+        assert_eq!(paused.message.as_deref(), Some("paused"));
+
+        channel.resume().await.expect("resume should succeed");
+        let resumed = channel.health().await.expect("health should succeed");
+        assert_eq!(resumed.message.as_deref(), Some("disconnected"));
+    }
+
+    #[tokio::test]
+    async fn outbound_send_fails_after_shutdown() {
+        let channel = AmqpOutboundChannel::new(AmqpOutboundConfig {
+            name: "amqp-out".to_string(),
+            url: "amqp://127.0.0.1:5672/%2f".to_string(),
+            exchange: "".to_string(),
+            routing_key: "mx.outbound".to_string(),
+        });
+        channel.shutdown().await.expect("shutdown should succeed");
+
+        let err = channel
+            .send(OutboundMessage {
+                raw: "<Document/>".to_string(),
+                content_type: "application/xml".to_string(),
+            })
+            .await
+            .expect_err("send should fail once channel is shut down");
+        assert!(err.to_string().contains("shut down"));
+    }
+}
