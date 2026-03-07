@@ -297,14 +297,24 @@ participants = [{ name = "message-logger" }]
 
     #[test]
     fn rejects_invalid_admin_auth_mode() {
-        let config = format!("{BASE_CONFIG}\n[runtime.admin_auth]\nmode = \"invalid\"\n");
+        let config = format!(
+            r#"{BASE_CONFIG}
+[runtime.admin_auth]
+mode = "invalid"
+"#
+        );
         let result = RuntimeConfig::parse(&config);
         assert!(result.is_err());
     }
 
     #[test]
     fn requires_jwt_secret_when_jwt_mode_enabled() {
-        let config = format!("{BASE_CONFIG}\n[runtime.admin_auth]\nmode = \"jwt_hs256\"\n");
+        let config = format!(
+            r#"{BASE_CONFIG}
+[runtime.admin_auth]
+mode = "jwt_hs256"
+"#
+        );
         let result = RuntimeConfig::parse(&config);
         assert!(result.is_err());
     }
@@ -312,9 +322,282 @@ participants = [{ name = "message-logger" }]
     #[test]
     fn accepts_jwt_mode_with_secret() {
         let config = format!(
-            "{BASE_CONFIG}\n[runtime.admin_auth]\nmode = \"jwt_hs256\"\njwt_hs256_secret = \"secret\"\n"
+            r#"{BASE_CONFIG}
+[runtime.admin_auth]
+mode = "jwt_hs256"
+jwt_hs256_secret = "secret"
+"#
         );
         let result = RuntimeConfig::parse(&config);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn rejects_empty_runtime_name() {
+        let config = BASE_CONFIG.replace(r#"name = "runtime""#, r#"name = "   ""#);
+        let result = RuntimeConfig::parse(&config);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("runtime.name must not be empty"));
+    }
+
+    #[test]
+    fn rejects_missing_channel_in_reference() {
+        let config = BASE_CONFIG.replace(
+            r#"channel_in = "http-in""#,
+            r#"channel_in = "missing-channel""#,
+        );
+        let result = RuntimeConfig::parse(&config);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("references missing channel_in"));
+    }
+
+    #[test]
+    fn rejects_missing_channel_out_reference() {
+        let config = format!(
+            r#"{BASE_CONFIG}
+[[pipeline]]
+name = "with-out"
+channel_in = "http-in"
+channel_out = "missing-out"
+participants = [{{ name = "message-logger" }}]
+"#
+        );
+        let result = RuntimeConfig::parse(&config);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("references missing channel_out"));
+    }
+
+    #[test]
+    fn rejects_pipeline_without_participants() {
+        let config = BASE_CONFIG.replace(
+            r#"participants = [{ name = "message-logger" }]"#,
+            "participants = []",
+        );
+        let result = RuntimeConfig::parse(&config);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("must include at least one participant"));
+    }
+
+    #[test]
+    fn rejects_zero_recovery_startup_limit() {
+        let config = BASE_CONFIG.replace(
+            r#"instance_id = "local""#,
+            r#"instance_id = "local"
+recovery_startup_limit = 0"#,
+        );
+        let result = RuntimeConfig::parse(&config);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("recovery_startup_limit must be greater than 0"));
+    }
+
+    #[test]
+    fn rejects_empty_mtls_subject_header_when_required() {
+        let config = format!(
+            r#"{BASE_CONFIG}
+[runtime.admin_auth]
+require_mtls_subject = true
+mtls_subject_header = "   "
+"#
+        );
+        let result = RuntimeConfig::parse(&config);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("mtls_subject_header must not be empty"));
+    }
+
+    fn assert_validation_error(config: &str, expected: &str) {
+        let result = RuntimeConfig::parse(config);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains(expected));
+    }
+
+    #[test]
+    fn rejects_empty_runtime_instance_id() {
+        let config = BASE_CONFIG.replace(r#"instance_id = "local""#, r#"instance_id = """#);
+        assert_validation_error(&config, "runtime.instance_id must not be empty");
+    }
+
+    #[test]
+    fn rejects_runtime_instance_id_with_only_whitespace() {
+        let config = BASE_CONFIG.replace(r#"instance_id = "local""#, r#"instance_id = "   ""#);
+        assert_validation_error(&config, "runtime.instance_id must not be empty");
+    }
+
+    #[test]
+    fn rejects_when_no_pipeline_is_defined() {
+        let config = BASE_CONFIG.replace(
+            r#"
+[[pipeline]]
+name = "demo"
+channel_in = "http-in"
+participants = [{ name = "message-logger" }]
+"#,
+            "
+",
+        );
+        assert_validation_error(&config, "at least one [[pipeline]] is required");
+    }
+
+    #[test]
+    fn rejects_pipeline_name_when_empty() {
+        let config = BASE_CONFIG.replace(r#"name = "demo""#, r#"name = """#);
+        assert_validation_error(&config, "pipeline.name must not be empty");
+    }
+
+    #[test]
+    fn rejects_pipeline_name_when_whitespace_only() {
+        let config = BASE_CONFIG.replace(r#"name = "demo""#, r#"name = "   ""#);
+        assert_validation_error(&config, "pipeline.name must not be empty");
+    }
+
+    #[test]
+    fn accepts_admin_auth_mode_disabled() {
+        let config = format!(
+            r#"{BASE_CONFIG}
+[runtime.admin_auth]
+mode = "disabled"
+"#
+        );
+        assert!(RuntimeConfig::parse(&config).is_ok());
+    }
+
+    #[test]
+    fn accepts_admin_auth_mode_legacy_bearer() {
+        let config = format!(
+            r#"{BASE_CONFIG}
+[runtime.admin_auth]
+mode = "legacy_bearer"
+"#
+        );
+        assert!(RuntimeConfig::parse(&config).is_ok());
+    }
+
+    #[test]
+    fn rejects_jwt_mode_when_secret_is_empty() {
+        let config = format!(
+            r#"{BASE_CONFIG}
+[runtime.admin_auth]
+mode = "jwt_hs256"
+jwt_hs256_secret = ""
+"#
+        );
+        assert_validation_error(
+            &config,
+            "runtime.admin_auth.jwt_hs256_secret must be set when mode=jwt_hs256",
+        );
+    }
+
+    #[test]
+    fn rejects_jwt_mode_when_secret_is_whitespace_only() {
+        let config = format!(
+            r#"{BASE_CONFIG}
+[runtime.admin_auth]
+mode = "jwt_hs256"
+jwt_hs256_secret = "   "
+"#
+        );
+        assert_validation_error(
+            &config,
+            "runtime.admin_auth.jwt_hs256_secret must be set when mode=jwt_hs256",
+        );
+    }
+
+    #[test]
+    fn accepts_recovery_startup_limit_when_positive() {
+        let config = BASE_CONFIG.replace(
+            r#"instance_id = "local""#,
+            r#"instance_id = "local"
+recovery_startup_limit = 10"#,
+        );
+        assert!(RuntimeConfig::parse(&config).is_ok());
+    }
+
+    #[test]
+    fn accepts_when_mtls_subject_not_required_and_header_empty() {
+        let config = format!(
+            r#"{BASE_CONFIG}
+[runtime.admin_auth]
+require_mtls_subject = false
+mtls_subject_header = ""
+"#
+        );
+        assert!(RuntimeConfig::parse(&config).is_ok());
+    }
+
+    #[test]
+    fn parse_returns_toml_parse_error_for_malformed_input() {
+        let malformed = r#"[runtime
+name = "runtime""#;
+        let result = RuntimeConfig::parse(malformed);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("toml parse error"));
+    }
+
+    #[test]
+    fn parse_preserves_message_type_entries() {
+        let config = format!(
+            r#"{BASE_CONFIG}
+[[pipeline]]
+name = "typed"
+channel_in = "http-in"
+message_types = ["pacs.008", "pain.001"]
+participants = [{{ name = "message-logger" }}]
+"#
+        );
+        let parsed = RuntimeConfig::parse(&config).expect("config should parse");
+        let typed = parsed
+            .pipelines
+            .iter()
+            .find(|p| p.name == "typed")
+            .expect("typed pipeline should exist");
+        assert_eq!(typed.message_types, vec!["pacs.008", "pain.001"]);
+    }
+
+    #[test]
+    fn parse_preserves_channel_extra_fields() {
+        let config = format!(
+            r#"{BASE_CONFIG}
+[channels.http-extra]
+type = "http"
+mode = "server"
+bind = "0.0.0.0:9090"
+path = "/inbox"
+"#
+        );
+        let parsed = RuntimeConfig::parse(&config).expect("config should parse");
+        let channel = parsed
+            .channels
+            .get("http-extra")
+            .expect("http-extra channel should exist");
+        assert_eq!(channel.channel_type, "http");
+        assert_eq!(channel.mode, "server");
+        assert_eq!(
+            channel.extra.get("path").and_then(|value| value.as_str()),
+            Some("/inbox")
+        );
+    }
+
+    #[test]
+    fn validate_accepts_minimal_valid_configuration() {
+        let parsed = RuntimeConfig::parse(BASE_CONFIG).expect("base config should be valid");
+        assert_eq!(parsed.runtime.name, "runtime");
+        assert_eq!(parsed.pipelines.len(), 1);
     }
 }

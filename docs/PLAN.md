@@ -7,6 +7,7 @@ This plan tracks delivery of `mx20022-runtime` from scaffold to the v0.1 goals i
 - Workspace and crate layout scaffolded.
 - Core lifecycle primitives implemented in `mx20022-runtime-core`.
 - Config parsing and validation skeleton implemented in `mx20022-config`.
+- Config validation coverage expanded for runtime auth, pipeline references, recovery constraints, and parse/shape regressions (15+ config-focused tests).
 - Runtime bootstrap binary loads TOML config and validates topology.
 
 ## Milestone 1: Core Engine (v0.1-a)
