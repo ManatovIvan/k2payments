@@ -9,7 +9,7 @@ async-trait.workspace = true
 serde.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
-jsonwebtoken = "9"
+jsonwebtoken = "10"
 mx20022-store = { path = "../mx20022-store" }
 mx20022-metrics = { path = "../mx20022-metrics" }
 serde_json = "1"
