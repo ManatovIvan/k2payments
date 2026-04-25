@@ -9,7 +9,7 @@ async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+mx20022-crypto = { path = "../mx20022-crypto" }
 tokio.workspace = true
-jsonwebtoken = "10"
+jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
 secrecy.workspace = true
-subtle.workspace = true

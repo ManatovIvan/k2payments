@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 mx20022-channels = { path = "../../mx20022-channels" }
+mx20022-crypto = { path = "../../mx20022-crypto" }
 async-trait.workspace = true
 tokio.workspace = true
 tracing.workspace = true

@@ -4,9 +4,9 @@
 use std::collections::HashSet;
 
 use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
+use mx20022_crypto::auth::{constant_time_eq, parse_bearer_token};
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
-use subtle::ConstantTimeEq;
 
 use crate::ChannelError;
 
@@ -189,43 +189,14 @@ fn verify_mtls(config: &InboundAuthConfig, mtls_subject: Option<&str>) -> Result
     }
 }
 
-pub fn parse_bearer_token(header: Option<&str>) -> Option<&str> {
-    let value = header?;
-    let (scheme, token) = value.split_once(' ')?;
-    if !scheme.eq_ignore_ascii_case("bearer") {
-        return None;
-    }
-    let token = token.trim();
-    if token.is_empty() {
-        return None;
-    }
-    Some(token)
-}
-
-pub fn constant_time_eq(left: &str, right: &str) -> bool {
-    let left = left.as_bytes();
-    let right = right.as_bytes();
-    let max_len = left.len().max(right.len());
-
-    let mut left_padded = vec![0_u8; max_len];
-    let mut right_padded = vec![0_u8; max_len];
-    left_padded[..left.len()].copy_from_slice(left);
-    right_padded[..right.len()].copy_from_slice(right);
-
-    let content_eq = left_padded.ct_eq(&right_padded);
-    let len_eq = (left.len() as u64).ct_eq(&(right.len() as u64));
-    bool::from(content_eq & len_eq)
-}
-
 #[cfg(test)]
 mod tests {
     use jsonwebtoken::{encode, EncodingKey, Header};
+    use mx20022_crypto::auth::constant_time_eq;
     use secrecy::SecretString;
     use serde::Serialize;
 
-    use super::{
-        authorize_inbound, constant_time_eq, InboundAuthConfig, InboundAuthContext, InboundAuthMode,
-    };
+    use super::{authorize_inbound, InboundAuthConfig, InboundAuthContext, InboundAuthMode};
 
     #[derive(Debug, Serialize)]
     struct Claims {
