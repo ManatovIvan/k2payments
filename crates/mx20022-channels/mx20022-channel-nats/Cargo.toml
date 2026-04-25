@@ -9,5 +9,5 @@ mx20022-channels = { path = "../../mx20022-channels" }
 async-trait.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-async-nats = "0.46"
+async-nats = "0.47"
 futures-util = "0.3"

@@ -8,6 +8,7 @@ license.workspace = true
 serde.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
+subtle.workspace = true
 aes-gcm = "0.10"
 rand = "0.8"
 base64 = "0.22"
