@@ -21,6 +21,8 @@ jobs:
     steps:
       - name: Check CLA
         uses: contributor-assistant/github-action@v2.6.1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           path-to-signatures: .github/cla-signatures/version1/cla.json
           path-to-document: docs/legal/ICLA.md
