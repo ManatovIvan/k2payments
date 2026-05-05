@@ -21,7 +21,7 @@ use mx20022_runtime::engine;
 use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 use tracing_subscriber::reload::Handle;
-use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 #[tokio::main]
 async fn main() {
@@ -220,7 +220,7 @@ async fn run(
 async fn shutdown_signal() {
     #[cfg(unix)]
     {
-        use tokio::signal::unix::{SignalKind, signal};
+        use tokio::signal::unix::{signal, SignalKind};
         let mut sigterm = match signal(SignalKind::terminate()) {
             Ok(stream) => stream,
             Err(error) => {

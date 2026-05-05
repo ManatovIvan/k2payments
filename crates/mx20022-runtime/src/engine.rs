@@ -681,10 +681,7 @@ auth_bearer_token = "secret"
     fn pick_free_port() -> u16 {
         let listener =
             std::net::TcpListener::bind("127.0.0.1:0").expect("must bind ephemeral port");
-        listener
-            .local_addr()
-            .expect("must read local addr")
-            .port()
+        listener.local_addr().expect("must read local addr").port()
     }
 
     #[cfg(feature = "channel-http")]
@@ -721,8 +718,8 @@ participants = [{{ name = "message-logger" }}]
     async fn run_pipelines_returns_ok_when_shutdown_signals_immediately() {
         use std::sync::Arc;
 
-        use crate::app::RuntimeApp;
         use super::run_pipelines;
+        use crate::app::RuntimeApp;
 
         let port = pick_free_port();
         let config = runnable_config(port);
@@ -733,10 +730,12 @@ participants = [{{ name = "message-logger" }}]
         );
         // Already-resolved future = signal the engine to drain on first poll.
         let shutdown = async {};
-        let result =
-            tokio::time::timeout(std::time::Duration::from_secs(5), run_pipelines(app, config, shutdown))
-                .await
-                .expect("engine should exit before timeout");
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            run_pipelines(app, config, shutdown),
+        )
+        .await
+        .expect("engine should exit before timeout");
         assert!(result.is_ok(), "engine returned error: {:?}", result.err());
     }
 
@@ -745,8 +744,8 @@ participants = [{{ name = "message-logger" }}]
     async fn run_pipelines_returns_no_supported_pipelines_when_no_inbound_starts() {
         use std::sync::Arc;
 
-        use crate::app::RuntimeApp;
         use super::{run_pipelines, EngineError};
+        use crate::app::RuntimeApp;
 
         let port = pick_free_port();
         let mut config = runnable_config(port);

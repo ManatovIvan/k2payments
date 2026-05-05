@@ -340,7 +340,10 @@ mod tests {
     use mx20022_channels::{InboundChannel, OutboundChannel, OutboundMessage};
     use tokio::sync::{mpsc, RwLock};
 
-    use super::{handle_post, HttpInboundChannel, HttpInboundConfig, HttpOutboundChannel, HttpOutboundConfig, InboundState};
+    use super::{
+        handle_post, HttpInboundChannel, HttpInboundConfig, HttpOutboundChannel,
+        HttpOutboundConfig, InboundState,
+    };
 
     #[tokio::test]
     async fn inbound_handler_enqueues_message() {
@@ -399,7 +402,10 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::ACCEPTED);
 
         // Verify the message was queued.
-        let msg = rx.recv().await.expect("should receive pre-shutdown message");
+        let msg = rx
+            .recv()
+            .await
+            .expect("should receive pre-shutdown message");
         assert_eq!(msg.raw, "<Document/>");
 
         // Trigger graceful shutdown.

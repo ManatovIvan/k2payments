@@ -790,7 +790,10 @@ impl ParticipantRegistry {
         #[cfg(test)]
         registry.register("correlation-key-setter", build_correlation_key_setter);
         #[cfg(test)]
-        registry.register("correlation-expectation-setter", build_correlation_expectation_setter);
+        registry.register(
+            "correlation-expectation-setter",
+            build_correlation_expectation_setter,
+        );
         registry
     }
 
@@ -1089,7 +1092,13 @@ impl Participant for SlowParticipant {
     fn name(&self) -> &str {
         "slow"
     }
-    async fn prepare(&self, _ctx: &mut Context) -> Result<mx20022_runtime_core::participant::Action, mx20022_runtime_core::participant::ParticipantError> {
+    async fn prepare(
+        &self,
+        _ctx: &mut Context,
+    ) -> Result<
+        mx20022_runtime_core::participant::Action,
+        mx20022_runtime_core::participant::ParticipantError,
+    > {
         tokio::time::sleep(Duration::from_millis(self.sleep_ms)).await;
         Ok(mx20022_runtime_core::participant::Action::Prepared)
     }
@@ -1124,8 +1133,10 @@ impl Participant for CorrelationKeySetter {
     async fn prepare(
         &self,
         ctx: &mut Context,
-    ) -> Result<mx20022_runtime_core::participant::Action, mx20022_runtime_core::participant::ParticipantError>
-    {
+    ) -> Result<
+        mx20022_runtime_core::participant::Action,
+        mx20022_runtime_core::participant::ParticipantError,
+    > {
         ctx.put(
             "correlation.lookup_key",
             CorrelationLookupKey {
@@ -1177,8 +1188,10 @@ impl Participant for CorrelationExpectationSetter {
     async fn prepare(
         &self,
         ctx: &mut Context,
-    ) -> Result<mx20022_runtime_core::participant::Action, mx20022_runtime_core::participant::ParticipantError>
-    {
+    ) -> Result<
+        mx20022_runtime_core::participant::Action,
+        mx20022_runtime_core::participant::ParticipantError,
+    > {
         ctx.put(
             "correlation.expectation",
             mx20022_store::Expectation {
@@ -1605,7 +1618,13 @@ participants = [
             .expect("app should build");
 
         let err = app
-            .process("timeout-pipeline", "TX-TO-1", "http-in", "pacs.008", "<Document/>")
+            .process(
+                "timeout-pipeline",
+                "TX-TO-1",
+                "http-in",
+                "pacs.008",
+                "<Document/>",
+            )
             .await
             .expect_err("should timeout");
 
@@ -1648,8 +1667,7 @@ participants = [
 
     #[tokio::test]
     async fn correlation_match_response_invoked_for_committed_transaction() {
-        let config =
-            RuntimeConfig::parse(CORRELATION_MATCH_CONFIG).expect("config should parse");
+        let config = RuntimeConfig::parse(CORRELATION_MATCH_CONFIG).expect("config should parse");
         let app = RuntimeApp::from_config(&config)
             .await
             .expect("app should build");
@@ -1789,8 +1807,7 @@ participants = [
     #[tokio::test]
     async fn build_business_rule_validator_extracts_scheme() {
         for scheme in &["fednow", "sepa", "cbpr"] {
-            let toml =
-                builder_config!("business-rule-validator", format!("scheme = '{}'", scheme));
+            let toml = builder_config!("business-rule-validator", format!("scheme = '{}'", scheme));
             let config = RuntimeConfig::parse(&toml).expect("config should parse");
             let app = RuntimeApp::from_config(&config).await;
             assert!(
@@ -1828,10 +1845,7 @@ participants = [
         for scope in &["global", "message_type", "source_channel"] {
             let toml = builder_config!(
                 "rate-limiter",
-                format!(
-                    "rate_per_second = 50.0, burst = 100.0, scope = '{}'",
-                    scope
-                )
+                format!("rate_per_second = 50.0, burst = 100.0, scope = '{}'", scope)
             );
             let config = RuntimeConfig::parse(&toml).expect("config should parse");
             let app = RuntimeApp::from_config(&config).await;
@@ -1918,10 +1932,7 @@ participants = [
 
     #[tokio::test]
     async fn build_routing_engine_rejects_rule_without_destination() {
-        let toml = builder_config!(
-            "routing-engine",
-            "rules = [{message_type = 'pacs.008'}]"
-        );
+        let toml = builder_config!("routing-engine", "rules = [{message_type = 'pacs.008'}]");
         let config = RuntimeConfig::parse(&toml).expect("config should parse");
         let err = match RuntimeApp::from_config(&config).await {
             Ok(_) => panic!("rule without destination should fail"),
@@ -2116,8 +2127,7 @@ participants = [
 
     #[tokio::test]
     async fn unknown_participant_name_returns_error() {
-        let config =
-            RuntimeConfig::parse(UNKNOWN_PARTICIPANT_CONFIG).expect("config should parse");
+        let config = RuntimeConfig::parse(UNKNOWN_PARTICIPANT_CONFIG).expect("config should parse");
         match RuntimeApp::from_config(&config).await {
             Err(RuntimeBuildError::UnknownParticipant(name)) => {
                 assert_eq!(name, "nonexistent-participant");

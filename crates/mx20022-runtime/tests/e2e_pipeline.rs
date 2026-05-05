@@ -159,7 +159,13 @@ async fn e2e_process_pacs008_commits_and_persists_context() {
         .expect("app should build");
 
     let report = app
-        .process("e2e", "TX-E2E-1", "http-in", "pacs.008", pacs008_xml("MSG-E2E-1"))
+        .process(
+            "e2e",
+            "TX-E2E-1",
+            "http-in",
+            "pacs.008",
+            pacs008_xml("MSG-E2E-1"),
+        )
         .await
         .expect("process should succeed");
 
@@ -218,7 +224,12 @@ async fn e2e_multi_participant_commits_with_context_entries() {
     );
     // Neither participant should have errored
     for pr in &report.participant_results {
-        assert!(pr.error.is_none(), "{} errored: {:?}", pr.participant, pr.error);
+        assert!(
+            pr.error.is_none(),
+            "{} errored: {:?}",
+            pr.participant,
+            pr.error
+        );
     }
 
     let store = app.store_handle();
@@ -377,7 +388,13 @@ async fn e2e_unknown_pipeline_returns_error() {
         .expect("app should build");
 
     let err = app
-        .process("nonexistent", "TX-ERR-1", "http-in", "pacs.008", "<Document/>")
+        .process(
+            "nonexistent",
+            "TX-ERR-1",
+            "http-in",
+            "pacs.008",
+            "<Document/>",
+        )
         .await
         .expect_err("should fail for unknown pipeline");
 
@@ -400,10 +417,7 @@ async fn e2e_rejected_message_type_returns_error() {
         .expect_err("should fail for unsupported message type");
 
     let msg = err.to_string();
-    assert!(
-        msg.contains("not accepted"),
-        "unexpected error: {msg}"
-    );
+    assert!(msg.contains("not accepted"), "unexpected error: {msg}");
 }
 
 #[tokio::test]
@@ -414,10 +428,22 @@ async fn e2e_multi_pipeline_routing() {
         .expect("app should build");
 
     assert_eq!(app.pipeline_count().await, 2);
-    assert!(app.accepts_message_type("pacs008-pipeline", "pacs.008").await);
-    assert!(app.accepts_message_type("pacs002-pipeline", "pacs.002").await);
-    assert!(!app.accepts_message_type("pacs008-pipeline", "pacs.002").await);
-    assert!(!app.accepts_message_type("pacs002-pipeline", "pacs.008").await);
+    assert!(
+        app.accepts_message_type("pacs008-pipeline", "pacs.008")
+            .await
+    );
+    assert!(
+        app.accepts_message_type("pacs002-pipeline", "pacs.002")
+            .await
+    );
+    assert!(
+        !app.accepts_message_type("pacs008-pipeline", "pacs.002")
+            .await
+    );
+    assert!(
+        !app.accepts_message_type("pacs002-pipeline", "pacs.008")
+            .await
+    );
 
     // Process through pipeline 1
     let report1 = app
