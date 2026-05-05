@@ -194,6 +194,13 @@ pub trait Store: Send + Sync {
 
     async fn health(&self) -> Result<StoreHealth, StoreError>;
     async fn compact(&self) -> Result<(), StoreError>;
+
+    /// Flush any buffered writes and prepare for orderly process exit.
+    /// Default is a no-op; backends that require explicit flush for durability
+    /// (e.g. RocksDB WAL sync) should override.
+    async fn shutdown(&self) -> Result<(), StoreError> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

@@ -22,3 +22,7 @@ Thumbs.db
 # Temporary files
 *.tmp
 *.bak
+
+# SDD agent context database WAL sidecars (the .db itself is committed)
+docs/agent_context.db-shm
+docs/agent_context.db-wal

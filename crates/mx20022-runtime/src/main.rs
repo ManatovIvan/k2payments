@@ -20,23 +20,44 @@ use mx20022_runtime::app::RuntimeApp;
 use mx20022_runtime::engine;
 use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::reload::Handle;
+use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .init();
+    let reload_handle = init_tracing();
 
-    if let Err(error) = run().await {
+    if let Err(error) = run(reload_handle).await {
         tracing::error!(error = %error, "runtime startup failed");
         process::exit(1);
     }
 }
 
-async fn run() -> Result<(), RuntimeBootstrapError> {
+/// Install the tracing subscriber with an early filter (RUST_LOG, else "info")
+/// and return a reload handle so the runtime can re-target the filter after
+/// the config-supplied `runtime.log_level` is known.
+fn init_tracing() -> Handle<EnvFilter, tracing_subscriber::Registry> {
+    let early = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let (filter_layer, handle) = tracing_subscriber::reload::Layer::new(early);
+    tracing_subscriber::registry()
+        .with(filter_layer)
+        .with(tracing_subscriber::fmt::layer())
+        .init();
+    handle
+}
+
+async fn run(
+    reload_handle: Handle<EnvFilter, tracing_subscriber::Registry>,
+) -> Result<(), RuntimeBootstrapError> {
     let cli = parse_cli(env::args())?;
     let config = RuntimeConfig::load_from_path(&cli.config_path)?;
+    // RUST_LOG wins over runtime.log_level so operators can override at
+    // deploy time without editing config. Only re-target if RUST_LOG is unset.
+    if env::var_os("RUST_LOG").is_none() {
+        if let Ok(filter) = EnvFilter::try_new(&config.runtime.log_level) {
+            let _ = reload_handle.modify(|f| *f = filter);
+        }
+    }
     let app = Arc::new(RuntimeApp::from_config(&config).await?);
     let reload_status = Arc::new(RwLock::new(ReloadStatus {
         config_version: compute_config_version(&cli.config_path)
@@ -102,7 +123,7 @@ async fn run() -> Result<(), RuntimeBootstrapError> {
             tracing::info!(bind = %admin_bind, grpc_bind = %admin_grpc_bind, "starting admin http+grpc hosts and pipeline engine");
 
             tokio::select! {
-                res = engine::run_pipelines(Arc::clone(&app), config.clone()) => {
+                res = engine::run_pipelines(Arc::clone(&app), config.clone(), shutdown_signal()) => {
                     res.map_err(RuntimeBootstrapError::Engine)?;
                 }
                 res = host::serve_with_tls_and_cors(&admin_bind, Arc::clone(&controller), admin_auth.clone(), admin_tls.clone(), admin_cors_allowed_origins.clone()) => {
@@ -120,7 +141,7 @@ async fn run() -> Result<(), RuntimeBootstrapError> {
             tracing::info!(bind = %admin_bind, "starting admin host and pipeline engine");
 
             tokio::select! {
-                res = engine::run_pipelines(Arc::clone(&app), config.clone()) => {
+                res = engine::run_pipelines(Arc::clone(&app), config.clone(), shutdown_signal()) => {
                     res.map_err(RuntimeBootstrapError::Engine)?;
                 }
                 res = host::serve_with_tls_and_cors(&admin_bind, controller, admin_auth.clone(), admin_tls.clone(), admin_cors_allowed_origins.clone()) => {
@@ -135,7 +156,7 @@ async fn run() -> Result<(), RuntimeBootstrapError> {
             tracing::info!(grpc_bind = %admin_grpc_bind, "starting admin grpc host and pipeline engine");
 
             tokio::select! {
-                res = engine::run_pipelines(Arc::clone(&app), config.clone()) => {
+                res = engine::run_pipelines(Arc::clone(&app), config.clone(), shutdown_signal()) => {
                     res.map_err(RuntimeBootstrapError::Engine)?;
                 }
                 res = grpc::serve_with_tls(&admin_grpc_bind, controller, admin_auth.clone(), admin_tls.clone()) => {
@@ -145,7 +166,7 @@ async fn run() -> Result<(), RuntimeBootstrapError> {
         }
         (true, false, false) => {
             tracing::info!("starting pipeline engine");
-            engine::run_pipelines(Arc::clone(&app), config.clone())
+            engine::run_pipelines(Arc::clone(&app), config.clone(), shutdown_signal())
                 .await
                 .map_err(RuntimeBootstrapError::Engine)?;
         }
@@ -194,6 +215,34 @@ async fn run() -> Result<(), RuntimeBootstrapError> {
     }
 
     Ok(())
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut sigterm = match signal(SignalKind::terminate()) {
+            Ok(stream) => stream,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "failed to install SIGTERM handler; falling back to SIGINT only"
+                );
+                let _ = tokio::signal::ctrl_c().await;
+                tracing::info!("received SIGINT");
+                return;
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => tracing::info!("received SIGINT"),
+            _ = sigterm.recv() => tracing::info!("received SIGTERM"),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        tracing::info!("received Ctrl-C");
+    }
 }
 
 fn spawn_participant_reload_watcher(

@@ -105,5 +105,103 @@ fn bench_store_query(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_runtime_process, bench_store_query);
+fn build_3p_config(sqlite_path: &str) -> RuntimeConfig {
+    let raw = format!(
+        r#"
+[runtime]
+name = "bench-runtime"
+instance_id = "bench-01"
+
+[store]
+backend = "sqlite"
+url = "{sqlite_path}"
+
+[channels.http-in]
+type = "http"
+mode = "server"
+bind = "127.0.0.1:0"
+
+[[pipeline]]
+name = "bench-3p"
+channel_in = "http-in"
+participants = [
+  {{ name = "message-logger" }},
+  {{ name = "duplicate-checker" }},
+  {{ name = "circuit-breaker" }}
+]
+"#
+    );
+    RuntimeConfig::parse(&raw).expect("benchmark 3p runtime config should parse")
+}
+
+fn build_3p_runtime(rt: &tokio::runtime::Runtime) -> (TempDir, Arc<RuntimeApp>) {
+    let temp_dir = TempDir::new().expect("create temp dir");
+    let sqlite_path = temp_dir.path().join("bench-3p.db");
+    let cfg = build_3p_config(sqlite_path.to_str().expect("utf8 sqlite path"));
+    let app = rt
+        .block_on(RuntimeApp::from_config(&cfg))
+        .expect("build 3p runtime app");
+    (temp_dir, Arc::new(app))
+}
+
+fn bench_3p_process(c: &mut Criterion) {
+    let rt = tokio::runtime::Runtime::new().expect("create tokio runtime");
+    let (_temp_dir, app) = build_3p_runtime(&rt);
+    let counter = AtomicU64::new(1);
+
+    c.bench_function("runtime_app_process_3_participants", |b| {
+        b.to_async(&rt).iter(|| async {
+            let id = counter.fetch_add(1, Ordering::Relaxed);
+            let report = app
+                .process(
+                    "bench-3p",
+                    format!("TX-BENCH-3P-{id}"),
+                    "http-in",
+                    "pacs.008.001.08",
+                    "<Document/>",
+                )
+                .await
+                .expect("process 3p benchmark transaction");
+            black_box(report);
+        });
+    });
+}
+
+fn bench_concurrent_process(c: &mut Criterion) {
+    let rt = tokio::runtime::Runtime::new().expect("create tokio runtime");
+    let (_temp_dir, app) = build_runtime(&rt);
+    let counter = AtomicU64::new(1);
+
+    c.bench_function("runtime_app_process_concurrent_10", |b| {
+        b.to_async(&rt).iter(|| async {
+            let mut tasks = Vec::with_capacity(10);
+            for _ in 0..10 {
+                let app = app.clone();
+                let id = counter.fetch_add(1, Ordering::Relaxed);
+                tasks.push(tokio::spawn(async move {
+                    app.process(
+                        "bench",
+                        format!("TX-CONC-{id}"),
+                        "http-in",
+                        "pacs.008.001.08",
+                        "<Document/>",
+                    )
+                    .await
+                }));
+            }
+            for task in tasks {
+                let result = task.await.expect("spawn should not panic");
+                black_box(result.expect("concurrent process should succeed"));
+            }
+        });
+    });
+}
+
+criterion_group!(
+    benches,
+    bench_runtime_process,
+    bench_store_query,
+    bench_3p_process,
+    bench_concurrent_process
+);
 criterion_main!(benches);

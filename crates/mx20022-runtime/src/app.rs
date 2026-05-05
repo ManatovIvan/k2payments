@@ -227,6 +227,33 @@ impl RuntimeApp {
         Arc::clone(&self.store)
     }
 
+    /// Shut down every outbound channel currently registered on the app's
+    /// pipelines. Errors are logged and swallowed — drain is best-effort and
+    /// must not block on a single channel.
+    pub async fn shutdown_outbound_channels(&self) {
+        let outbounds: Vec<(String, Arc<dyn OutboundChannel>)> = {
+            let pipelines = self.pipelines.read().await;
+            pipelines
+                .iter()
+                .filter_map(|(name, pipeline)| {
+                    pipeline
+                        .outbound
+                        .as_ref()
+                        .map(|out| (name.clone(), Arc::clone(out)))
+                })
+                .collect()
+        };
+        for (pipeline_name, outbound) in outbounds {
+            if let Err(error) = outbound.shutdown().await {
+                tracing::warn!(
+                    pipeline = %pipeline_name,
+                    error = %error,
+                    "outbound channel shutdown error",
+                );
+            }
+        }
+    }
+
     pub async fn accepts_message_type(&self, pipeline: &str, message_type: &str) -> bool {
         let pipelines = self.pipelines.read().await;
         let Some(runtime) = pipelines.get(pipeline) else {
@@ -758,6 +785,12 @@ impl ParticipantRegistry {
         registry.register("routing-engine", build_routing_engine);
         registry.register("rate-limiter", build_rate_limiter);
         registry.register("circuit-breaker", build_circuit_breaker);
+        #[cfg(test)]
+        registry.register("slow", build_slow_participant);
+        #[cfg(test)]
+        registry.register("correlation-key-setter", build_correlation_key_setter);
+        #[cfg(test)]
+        registry.register("correlation-expectation-setter", build_correlation_expectation_setter);
         registry
     }
 
@@ -1046,16 +1079,167 @@ pub enum RuntimeBuildError {
 }
 
 #[cfg(test)]
+struct SlowParticipant {
+    sleep_ms: u64,
+}
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl Participant for SlowParticipant {
+    fn name(&self) -> &str {
+        "slow"
+    }
+    async fn prepare(&self, _ctx: &mut Context) -> Result<mx20022_runtime_core::participant::Action, mx20022_runtime_core::participant::ParticipantError> {
+        tokio::time::sleep(Duration::from_millis(self.sleep_ms)).await;
+        Ok(mx20022_runtime_core::participant::Action::Prepared)
+    }
+}
+
+#[cfg(test)]
+fn build_slow_participant(
+    cfg: &ParticipantConfig,
+    _store: Arc<dyn Store>,
+) -> Result<Arc<dyn Participant>, RuntimeBuildError> {
+    let sleep_ms = cfg
+        .config
+        .get("sleep_ms")
+        .and_then(|v| v.as_integer())
+        .map(|v| v as u64)
+        .unwrap_or(100);
+    Ok(Arc::new(SlowParticipant { sleep_ms }))
+}
+
+#[cfg(test)]
+struct CorrelationKeySetter {
+    correlation_key: String,
+    expected_message_type: String,
+}
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl Participant for CorrelationKeySetter {
+    fn name(&self) -> &str {
+        "correlation-key-setter"
+    }
+    async fn prepare(
+        &self,
+        ctx: &mut Context,
+    ) -> Result<mx20022_runtime_core::participant::Action, mx20022_runtime_core::participant::ParticipantError>
+    {
+        ctx.put(
+            "correlation.lookup_key",
+            CorrelationLookupKey {
+                correlation_key: self.correlation_key.clone(),
+                expected_message_type: self.expected_message_type.clone(),
+            },
+        );
+        Ok(mx20022_runtime_core::participant::Action::Prepared)
+    }
+}
+
+#[cfg(test)]
+fn build_correlation_key_setter(
+    cfg: &ParticipantConfig,
+    _store: Arc<dyn Store>,
+) -> Result<Arc<dyn Participant>, RuntimeBuildError> {
+    let correlation_key = cfg
+        .config
+        .get("correlation_key")
+        .and_then(|v| v.as_str())
+        .unwrap_or("MSG-DEFAULT")
+        .to_string();
+    let expected_message_type = cfg
+        .config
+        .get("expected_message_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("pacs.002")
+        .to_string();
+    Ok(Arc::new(CorrelationKeySetter {
+        correlation_key,
+        expected_message_type,
+    }))
+}
+
+#[cfg(test)]
+struct CorrelationExpectationSetter {
+    expectation_id: String,
+    correlation_key: String,
+    expected_message_type: String,
+    timeout_ms: u64,
+}
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl Participant for CorrelationExpectationSetter {
+    fn name(&self) -> &str {
+        "correlation-expectation-setter"
+    }
+    async fn prepare(
+        &self,
+        ctx: &mut Context,
+    ) -> Result<mx20022_runtime_core::participant::Action, mx20022_runtime_core::participant::ParticipantError>
+    {
+        ctx.put(
+            "correlation.expectation",
+            mx20022_store::Expectation {
+                id: self.expectation_id.clone(),
+                correlation_key: self.correlation_key.clone(),
+                expected_message_type: self.expected_message_type.clone(),
+                timeout_at: SystemTime::now() + Duration::from_millis(self.timeout_ms),
+            },
+        );
+        Ok(mx20022_runtime_core::participant::Action::Prepared)
+    }
+}
+
+#[cfg(test)]
+fn build_correlation_expectation_setter(
+    cfg: &ParticipantConfig,
+    _store: Arc<dyn Store>,
+) -> Result<Arc<dyn Participant>, RuntimeBuildError> {
+    let expectation_id = cfg
+        .config
+        .get("expectation_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("EXP-DEFAULT")
+        .to_string();
+    let correlation_key = cfg
+        .config
+        .get("correlation_key")
+        .and_then(|v| v.as_str())
+        .unwrap_or("MSG-DEFAULT")
+        .to_string();
+    let expected_message_type = cfg
+        .config
+        .get("expected_message_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("pacs.002")
+        .to_string();
+    let timeout_ms = cfg
+        .config
+        .get("timeout_ms")
+        .and_then(|v| v.as_integer())
+        .map(|v| v as u64)
+        .unwrap_or(60_000);
+    Ok(Arc::new(CorrelationExpectationSetter {
+        expectation_id,
+        correlation_key,
+        expected_message_type,
+        timeout_ms,
+    }))
+}
+
+#[cfg(test)]
 mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
-    use std::time::SystemTime;
+    use std::time::{Duration, SystemTime};
 
     use mx20022_config::RuntimeConfig;
     use mx20022_runtime_core::transaction_manager::Outcome;
     use mx20022_store::{Store, TransactionRecord};
 
-    use crate::app::RuntimeApp;
+    use crate::app::{RuntimeApp, RuntimeBuildError};
 
     const TEST_CONFIG: &str = r#"
 [runtime]
@@ -1387,5 +1571,559 @@ participants = [
                 .contains("participant order/topology changed"),
             "unexpected error: {error}"
         );
+    }
+
+    const TIMEOUT_CONFIG: &str = r#"
+[runtime]
+name = "test-runtime"
+instance_id = "local-01"
+
+[store]
+backend = "sqlite"
+url = "sqlite::memory:"
+
+[channels.http-in]
+type = "http"
+mode = "server"
+bind = "127.0.0.1:8080"
+
+[[pipeline]]
+name = "timeout-pipeline"
+channel_in = "http-in"
+message_types = ["pacs.008"]
+timeout_ms = 1
+participants = [
+  { name = "slow", config = { sleep_ms = 100 } },
+]
+"#;
+
+    #[tokio::test]
+    async fn timeout_forces_poison_state() {
+        let config = RuntimeConfig::parse(TIMEOUT_CONFIG).expect("config should parse");
+        let app = RuntimeApp::from_config(&config)
+            .await
+            .expect("app should build");
+
+        let err = app
+            .process("timeout-pipeline", "TX-TO-1", "http-in", "pacs.008", "<Document/>")
+            .await
+            .expect_err("should timeout");
+
+        assert!(
+            err.to_string().contains("timed out"),
+            "unexpected error: {err}"
+        );
+
+        let record = app
+            .store_handle()
+            .find_by_id("TX-TO-1")
+            .await
+            .expect("lookup")
+            .expect("record");
+        assert_eq!(record.state, "POISON");
+    }
+
+    const CORRELATION_MATCH_CONFIG: &str = r#"
+[runtime]
+name = "test-runtime"
+instance_id = "local-01"
+
+[store]
+backend = "sqlite"
+url = "sqlite::memory:"
+
+[channels.http-in]
+type = "http"
+mode = "server"
+bind = "127.0.0.1:8080"
+
+[[pipeline]]
+name = "correlation-match"
+channel_in = "http-in"
+message_types = ["pacs.008"]
+participants = [
+  { name = "correlation-key-setter", config = { correlation_key = "MSG-CORR-1", expected_message_type = "pacs.002" } },
+]
+"#;
+
+    #[tokio::test]
+    async fn correlation_match_response_invoked_for_committed_transaction() {
+        let config =
+            RuntimeConfig::parse(CORRELATION_MATCH_CONFIG).expect("config should parse");
+        let app = RuntimeApp::from_config(&config)
+            .await
+            .expect("app should build");
+
+        // Seed the store with a pending expectation that our lookup key will match
+        let store: Arc<dyn Store> = app.store_handle();
+        store
+            .save_expectation(&mx20022_store::Expectation {
+                id: "EXP-MATCH-1".to_string(),
+                correlation_key: "MSG-CORR-1".to_string(),
+                expected_message_type: "pacs.002".to_string(),
+                timeout_at: SystemTime::now() + Duration::from_secs(60),
+            })
+            .await
+            .expect("seed expectation should succeed");
+
+        let report = app
+            .process(
+                "correlation-match",
+                "TX-CORR-1",
+                "http-in",
+                "pacs.008",
+                "<Document/>",
+            )
+            .await
+            .expect("process should succeed");
+
+        assert_eq!(report.outcome, Outcome::Committed);
+
+        // The expectation should have been matched (no longer pending)
+        let pending = store
+            .count_pending_expectations()
+            .await
+            .expect("count should succeed");
+        assert_eq!(
+            pending, 0,
+            "expectation should have been matched and removed from pending"
+        );
+    }
+
+    const CORRELATION_REGISTER_CONFIG: &str = r#"
+[runtime]
+name = "test-runtime"
+instance_id = "local-01"
+
+[store]
+backend = "sqlite"
+url = "sqlite::memory:"
+
+[channels.http-in]
+type = "http"
+mode = "server"
+bind = "127.0.0.1:8080"
+
+[[pipeline]]
+name = "correlation-register"
+channel_in = "http-in"
+message_types = ["pacs.008"]
+participants = [
+  { name = "correlation-expectation-setter", config = { expectation_id = "EXP-REG-1", correlation_key = "MSG-CORR-2", expected_message_type = "pacs.002", timeout_ms = 60000 } },
+]
+"#;
+
+    #[tokio::test]
+    async fn correlation_register_invoked_for_committed_transaction() {
+        let config =
+            RuntimeConfig::parse(CORRELATION_REGISTER_CONFIG).expect("config should parse");
+        let app = RuntimeApp::from_config(&config)
+            .await
+            .expect("app should build");
+
+        let report = app
+            .process(
+                "correlation-register",
+                "TX-CORR-2",
+                "http-in",
+                "pacs.008",
+                "<Document/>",
+            )
+            .await
+            .expect("process should succeed");
+
+        assert_eq!(report.outcome, Outcome::Committed);
+
+        // The expectation should have been registered in the store
+        let store: Arc<dyn Store> = app.store_handle();
+        let pending = store
+            .load_pending_expectations()
+            .await
+            .expect("load should succeed");
+        assert_eq!(pending.len(), 1, "expectation should have been registered");
+        assert_eq!(pending[0].id, "EXP-REG-1");
+        assert_eq!(pending[0].correlation_key, "MSG-CORR-2");
+        assert_eq!(pending[0].expected_message_type, "pacs.002");
+    }
+
+    // ── Builder config tests: happy-path ───────────────────────────
+
+    macro_rules! builder_config {
+        ($name:expr, $config:expr) => {
+            format!(
+                r#"
+[runtime]
+name = "test-runtime"
+instance_id = "local-01"
+
+[store]
+backend = "sqlite"
+url = "sqlite::memory:"
+
+[channels.http-in]
+type = "http"
+mode = "server"
+bind = "127.0.0.1:8080"
+
+[[pipeline]]
+name = "test-pipeline"
+channel_in = "http-in"
+message_types = ["pacs.008"]
+participants = [
+  {{ name = "{}", config = {{ {} }} }},
+]
+"#,
+                $name, $config
+            )
+        };
+    }
+
+    #[tokio::test]
+    async fn build_message_logger_extracts_tag() {
+        let toml = builder_config!("message-logger", "tag = 'audit'");
+        let config = RuntimeConfig::parse(&toml).expect("config should parse");
+        let app = RuntimeApp::from_config(&config).await;
+        assert!(app.is_ok(), "message-logger with tag should build");
+    }
+
+    #[tokio::test]
+    async fn build_business_rule_validator_extracts_scheme() {
+        for scheme in &["fednow", "sepa", "cbpr"] {
+            let toml =
+                builder_config!("business-rule-validator", format!("scheme = '{}'", scheme));
+            let config = RuntimeConfig::parse(&toml).expect("config should parse");
+            let app = RuntimeApp::from_config(&config).await;
+            assert!(
+                app.is_ok(),
+                "business-rule-validator with scheme '{}' should build",
+                scheme
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn build_duplicate_checker_extracts_keys() {
+        let toml = builder_config!(
+            "duplicate-checker",
+            "keys = ['message_id', 'end_to_end_id', 'uetr']"
+        );
+        let config = RuntimeConfig::parse(&toml).expect("config should parse");
+        let app = RuntimeApp::from_config(&config).await;
+        assert!(app.is_ok(), "duplicate-checker with keys should build");
+    }
+
+    #[tokio::test]
+    async fn build_routing_engine_extracts_rules() {
+        let toml = builder_config!(
+            "routing-engine",
+            "default_route = 'eu-out', rules = [{destination = 'us-out', message_type = 'pacs.008'}]"
+        );
+        let config = RuntimeConfig::parse(&toml).expect("config should parse");
+        let app = RuntimeApp::from_config(&config).await;
+        assert!(app.is_ok(), "routing-engine with rules should build");
+    }
+
+    #[tokio::test]
+    async fn build_rate_limiter_extracts_scope() {
+        for scope in &["global", "message_type", "source_channel"] {
+            let toml = builder_config!(
+                "rate-limiter",
+                format!(
+                    "rate_per_second = 50.0, burst = 100.0, scope = '{}'",
+                    scope
+                )
+            );
+            let config = RuntimeConfig::parse(&toml).expect("config should parse");
+            let app = RuntimeApp::from_config(&config).await;
+            assert!(
+                app.is_ok(),
+                "rate-limiter with scope '{}' should build",
+                scope
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn build_circuit_breaker_extracts_threshold() {
+        let toml = builder_config!("circuit-breaker", "failure_threshold = 10, open_ms = 5000");
+        let config = RuntimeConfig::parse(&toml).expect("config should parse");
+        let app = RuntimeApp::from_config(&config).await;
+        assert!(app.is_ok(), "circuit-breaker with threshold should build");
+    }
+
+    #[tokio::test]
+    async fn build_status_response_builder_extracts_auto_pacs002() {
+        let toml = builder_config!("status-response-builder", "auto_pacs002 = false");
+        let config = RuntimeConfig::parse(&toml).expect("config should parse");
+        let app = RuntimeApp::from_config(&config).await;
+        assert!(
+            app.is_ok(),
+            "status-response-builder with auto_pacs002 should build"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_acknowledgement_builder_extracts_overwrite() {
+        let toml = builder_config!("acknowledgement-builder", "overwrite_existing = true");
+        let config = RuntimeConfig::parse(&toml).expect("config should parse");
+        let app = RuntimeApp::from_config(&config).await;
+        assert!(
+            app.is_ok(),
+            "acknowledgement-builder with overwrite should build"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_error_response_builder_extracts_overwrite() {
+        let toml = builder_config!("error-response-builder", "overwrite_existing = true");
+        let config = RuntimeConfig::parse(&toml).expect("config should parse");
+        let app = RuntimeApp::from_config(&config).await;
+        assert!(
+            app.is_ok(),
+            "error-response-builder with overwrite should build"
+        );
+    }
+
+    // ── Builder config tests: invalid config rejection ─────────────
+
+    #[tokio::test]
+    async fn build_business_rule_validator_rejects_unknown_scheme() {
+        let toml = builder_config!("business-rule-validator", "scheme = 'unknown-scheme'");
+        let config = RuntimeConfig::parse(&toml).expect("config should parse");
+        let err = match RuntimeApp::from_config(&config).await {
+            Ok(_) => panic!("unknown scheme should fail"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("unknown-scheme"),
+            "error should mention the bad scheme: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn build_duplicate_checker_rejects_unknown_key() {
+        let toml = builder_config!("duplicate-checker", "keys = ['bogus_field']");
+        let config = RuntimeConfig::parse(&toml).expect("config should parse");
+        let err = match RuntimeApp::from_config(&config).await {
+            Ok(_) => panic!("unknown key should fail"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("bogus_field"),
+            "error should mention the bad key: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn build_routing_engine_rejects_rule_without_destination() {
+        let toml = builder_config!(
+            "routing-engine",
+            "rules = [{message_type = 'pacs.008'}]"
+        );
+        let config = RuntimeConfig::parse(&toml).expect("config should parse");
+        let err = match RuntimeApp::from_config(&config).await {
+            Ok(_) => panic!("rule without destination should fail"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("destination"),
+            "error should mention missing destination: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn build_rate_limiter_rejects_unknown_scope() {
+        let toml = builder_config!("rate-limiter", "scope = 'per_participant'");
+        let config = RuntimeConfig::parse(&toml).expect("config should parse");
+        let err = match RuntimeApp::from_config(&config).await {
+            Ok(_) => panic!("unknown scope should fail"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("per_participant"),
+            "error should mention the bad scope: {}",
+            err
+        );
+    }
+
+    // ── Builder config tests: graceful handling of invalid types ───
+
+    #[tokio::test]
+    async fn build_message_logger_handles_non_string_tag() {
+        let toml = builder_config!("message-logger", "tag = 12345");
+        let config = RuntimeConfig::parse(&toml).expect("config should parse");
+        let app = RuntimeApp::from_config(&config).await;
+        assert!(app.is_ok(), "message-logger should ignore non-string tag");
+    }
+
+    #[tokio::test]
+    async fn build_circuit_breaker_handles_non_integer_threshold() {
+        let toml = builder_config!("circuit-breaker", "failure_threshold = 'not-a-number'");
+        let config = RuntimeConfig::parse(&toml).expect("config should parse");
+        let app = RuntimeApp::from_config(&config).await;
+        assert!(
+            app.is_ok(),
+            "circuit-breaker should ignore non-integer threshold"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_status_response_builder_handles_non_bool_auto() {
+        let toml = builder_config!("status-response-builder", "auto_pacs002 = 'yes'");
+        let config = RuntimeConfig::parse(&toml).expect("config should parse");
+        let app = RuntimeApp::from_config(&config).await;
+        assert!(
+            app.is_ok(),
+            "status-response-builder should ignore non-bool auto_pacs002"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_acknowledgement_builder_handles_non_bool_overwrite() {
+        let toml = builder_config!("acknowledgement-builder", "overwrite_existing = 'yes'");
+        let config = RuntimeConfig::parse(&toml).expect("config should parse");
+        let app = RuntimeApp::from_config(&config).await;
+        assert!(
+            app.is_ok(),
+            "acknowledgement-builder should ignore non-bool overwrite"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_error_response_builder_handles_non_bool_overwrite() {
+        let toml = builder_config!("error-response-builder", "overwrite_existing = 'yes'");
+        let config = RuntimeConfig::parse(&toml).expect("config should parse");
+        let app = RuntimeApp::from_config(&config).await;
+        assert!(
+            app.is_ok(),
+            "error-response-builder should ignore non-bool overwrite"
+        );
+    }
+
+    // ── T6: Negative Config Path Tests ───────────────────────────────────────
+
+    const UNSUPPORTED_STORE_BACKEND_CONFIG: &str = r#"
+[runtime]
+name = "test-runtime"
+instance_id = "local-01"
+
+[store]
+backend = "mongodb"
+url = "mongodb://localhost:27017/test"
+
+[channels.http-in]
+type = "http"
+mode = "server"
+bind = "127.0.0.1:8080"
+
+[[pipeline]]
+name = "demo"
+channel_in = "http-in"
+message_types = ["pacs.008"]
+participants = [
+  { name = "message-logger", config = {} },
+]
+"#;
+
+    #[tokio::test]
+    async fn unsupported_store_backend_returns_error() {
+        let config =
+            RuntimeConfig::parse(UNSUPPORTED_STORE_BACKEND_CONFIG).expect("config should parse");
+        match RuntimeApp::from_config(&config).await {
+            Err(RuntimeBuildError::UnsupportedStoreBackend(backend)) => {
+                assert_eq!(backend, "mongodb");
+            }
+            Err(other) => panic!("expected UnsupportedStoreBackend, got: {:?}", other),
+            Ok(_) => panic!("should reject unsupported store backend"),
+        }
+    }
+
+    const INCOMPATIBLE_OUTBOUND_CHANNEL_CONFIG: &str = r#"
+[runtime]
+name = "test-runtime"
+instance_id = "local-01"
+
+[store]
+backend = "sqlite"
+url = "sqlite::memory:"
+
+[channels.http-in]
+type = "http"
+mode = "server"
+bind = "127.0.0.1:8080"
+
+[[pipeline]]
+name = "bad-outbound"
+channel_in = "http-in"
+channel_out = "http-in"
+message_types = ["pacs.008"]
+participants = [
+  { name = "message-logger", config = {} },
+]
+"#;
+
+    #[tokio::test]
+    async fn incompatible_outbound_channel_returns_error() {
+        // Config validation only checks that channel_out *exists* in the
+        // channels map — it does not verify type/mode compatibility.
+        // from_config catches the case when the referenced channel cannot
+        // serve as an outbound (e.g., a server-mode channel).
+        let config = RuntimeConfig::parse(INCOMPATIBLE_OUTBOUND_CHANNEL_CONFIG)
+            .expect("config should parse (validation passes)");
+        match RuntimeApp::from_config(&config).await {
+            Err(RuntimeBuildError::Channel(msg)) => {
+                assert!(
+                    msg.contains("unsupported outbound channel"),
+                    "error should describe unsupported outbound, got: {}",
+                    msg
+                );
+                assert!(
+                    msg.contains("http-in"),
+                    "error should mention the channel name, got: {}",
+                    msg
+                );
+            }
+            Err(other) => panic!("expected Channel error, got: {:?}", other),
+            Ok(_) => panic!("should reject server-mode channel as outbound"),
+        }
+    }
+
+    const UNKNOWN_PARTICIPANT_CONFIG: &str = r#"
+[runtime]
+name = "test-runtime"
+instance_id = "local-01"
+
+[store]
+backend = "sqlite"
+url = "sqlite::memory:"
+
+[channels.http-in]
+type = "http"
+mode = "server"
+bind = "127.0.0.1:8080"
+
+[[pipeline]]
+name = "demo"
+channel_in = "http-in"
+message_types = ["pacs.008"]
+participants = [
+  { name = "nonexistent-participant", config = {} },
+]
+"#;
+
+    #[tokio::test]
+    async fn unknown_participant_name_returns_error() {
+        let config =
+            RuntimeConfig::parse(UNKNOWN_PARTICIPANT_CONFIG).expect("config should parse");
+        match RuntimeApp::from_config(&config).await {
+            Err(RuntimeBuildError::UnknownParticipant(name)) => {
+                assert_eq!(name, "nonexistent-participant");
+            }
+            Err(other) => panic!("expected UnknownParticipant, got: {:?}", other),
+            Ok(_) => panic!("should reject unknown participant name"),
+        }
     }
 }

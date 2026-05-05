@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use axum::body::Bytes;
@@ -19,7 +20,7 @@ use mx20022_channels::{
     ChannelError, ChannelHealth, DeliveryReceipt, InboundChannel, InboundMessage, OutboundChannel,
     OutboundMessage,
 };
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, watch, RwLock};
 use tower_http::cors::CorsLayer;
 
 #[derive(Debug, Clone)]
@@ -44,13 +45,18 @@ struct InboundState {
 pub struct HttpInboundChannel {
     config: HttpInboundConfig,
     paused: Arc<RwLock<bool>>,
+    shutdown_tx: Arc<watch::Sender<bool>>,
+    shutdown_rx: watch::Receiver<bool>,
 }
 
 impl HttpInboundChannel {
     pub fn new(config: HttpInboundConfig) -> Self {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
         Self {
             config,
             paused: Arc::new(RwLock::new(false)),
+            shutdown_tx: Arc::new(shutdown_tx),
+            shutdown_rx,
         }
     }
 }
@@ -92,7 +98,16 @@ impl InboundChannel for HttpInboundChannel {
                         ))
                     })?;
                 tracing::info!(channel = %self.config.name, bind = %self.config.bind, "http inbound channel starting with TLS");
+                let handle = axum_server::Handle::new();
+                let shutdown_handle = handle.clone();
+                let mut shutdown_rx = self.shutdown_rx.clone();
+                tokio::spawn(async move {
+                    let _ = shutdown_rx.changed().await;
+                    tracing::info!("TLS graceful shutdown triggered");
+                    shutdown_handle.graceful_shutdown(Some(Duration::from_secs(30)));
+                });
                 axum_server::bind_rustls(socket, tls)
+                    .handle(handle)
                     .serve(app.into_make_service())
                     .await
                     .map_err(|e| ChannelError::new(format!("inbound channel serve failed: {e}")))
@@ -104,7 +119,13 @@ impl InboundChannel for HttpInboundChannel {
                         ChannelError::new(format!("failed to bind inbound channel: {e}"))
                     })?;
                 tracing::warn!(channel = %self.config.name, bind = %self.config.bind, "http inbound channel starting without TLS");
+                let mut shutdown_rx = self.shutdown_rx.clone();
+                let shutdown_signal = async move {
+                    let _ = shutdown_rx.changed().await;
+                    tracing::info!("graceful shutdown triggered");
+                };
                 axum::serve(listener, app)
+                    .with_graceful_shutdown(shutdown_signal)
                     .await
                     .map_err(|e| ChannelError::new(format!("inbound channel serve failed: {e}")))
             }
@@ -115,6 +136,8 @@ impl InboundChannel for HttpInboundChannel {
     }
 
     async fn shutdown(&self) -> Result<(), ChannelError> {
+        tracing::info!(channel = %self.config.name, "http inbound channel shutting down");
+        let _ = self.shutdown_tx.send(true);
         Ok(())
     }
 
@@ -307,16 +330,17 @@ fn now_millis() -> u128 {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::time::Duration;
 
     use axum::http::HeaderMap;
     use axum::http::StatusCode;
     use axum::routing::post;
     use axum::{extract::State, Router};
     use mx20022_channels::auth::InboundAuthConfig;
-    use mx20022_channels::{OutboundChannel, OutboundMessage};
+    use mx20022_channels::{InboundChannel, OutboundChannel, OutboundMessage};
     use tokio::sync::{mpsc, RwLock};
 
-    use super::{handle_post, HttpOutboundChannel, HttpOutboundConfig, InboundState};
+    use super::{handle_post, HttpInboundChannel, HttpInboundConfig, HttpOutboundChannel, HttpOutboundConfig, InboundState};
 
     #[tokio::test]
     async fn inbound_handler_enqueues_message() {
@@ -334,6 +358,69 @@ mod tests {
         let queued = rx.recv().await.expect("message should be queued");
         assert_eq!(queued.raw, "<Document/>");
         assert_eq!(queued.content_type, "application/xml");
+    }
+
+    #[tokio::test]
+    async fn shutdown_drain() {
+        let (tx, mut rx) = mpsc::channel(10);
+
+        // Bind to a free port by creating a temporary listener.
+        let temp_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind temp listener");
+        let addr = temp_listener.local_addr().expect("resolve addr");
+        drop(temp_listener);
+
+        let channel = Arc::new(HttpInboundChannel::new(HttpInboundConfig {
+            name: "test-shutdown".to_string(),
+            bind: addr.to_string(),
+            content_type: "application/xml".to_string(),
+            auth: InboundAuthConfig::default(),
+            cors_allowed_origins: vec![],
+            tls_cert_path: None,
+            tls_key_path: None,
+        }));
+
+        let run_channel = Arc::clone(&channel);
+        let handle = tokio::spawn(async move { run_channel.run(tx).await });
+
+        // Wait for the server to be ready.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Send a message before shutdown — should succeed.
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://{addr}/"))
+            .header("content-type", "application/xml")
+            .body("<Document/>")
+            .send()
+            .await
+            .expect("pre-shutdown request");
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        // Verify the message was queued.
+        let msg = rx.recv().await.expect("should receive pre-shutdown message");
+        assert_eq!(msg.raw, "<Document/>");
+
+        // Trigger graceful shutdown.
+        channel.shutdown().await.expect("shutdown");
+
+        // Wait for the server to drain.
+        let result = tokio::time::timeout(Duration::from_secs(5), handle).await;
+        assert!(result.is_ok(), "server should shut down within timeout");
+        assert!(result.unwrap().is_ok(), "server task should not error");
+
+        // After shutdown, new requests should be rejected.
+        let err = client
+            .post(format!("http://{addr}/"))
+            .header("content-type", "application/xml")
+            .body("<AfterShutdown/>")
+            .send()
+            .await;
+        assert!(
+            err.is_err(),
+            "post-shutdown request should fail (connection refused)"
+        );
     }
 
     #[tokio::test]

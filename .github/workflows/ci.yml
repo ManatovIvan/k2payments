@@ -92,4 +92,4 @@ jobs:
       - name: Install cargo-llvm-cov
         run: cargo install cargo-llvm-cov --version 0.6.16 --locked
       - name: Coverage Gate
-        run: cargo llvm-cov --workspace --summary-only --fail-under-lines 55
+        run: cargo llvm-cov --workspace --summary-only --fail-under-lines 60
