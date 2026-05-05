@@ -32,8 +32,13 @@ use crate::app::RuntimeApp;
 static TX_COUNTER: AtomicU64 = AtomicU64::new(1);
 const INBOUND_CHANNEL_BUFFER: usize = 1024;
 
-pub async fn run_pipelines(app: Arc<RuntimeApp>, config: RuntimeConfig) -> Result<(), EngineError> {
+pub async fn run_pipelines(
+    app: Arc<RuntimeApp>,
+    config: RuntimeConfig,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> Result<(), EngineError> {
     let mut tasks = JoinSet::new();
+    let mut channels: Vec<Arc<dyn InboundChannel>> = Vec::new();
     let mut started = 0usize;
     let tx_id_prefix = build_tx_id_prefix(&config.runtime.instance_id);
 
@@ -146,6 +151,8 @@ pub async fn run_pipelines(app: Arc<RuntimeApp>, config: RuntimeConfig) -> Resul
                 }
             };
 
+        channels.push(Arc::clone(&inbound));
+
         let (tx, mut rx) = mpsc::channel::<InboundMessage>(INBOUND_CHANNEL_BUFFER);
         let inbound_channel = Arc::clone(&inbound);
         tasks.spawn(async move {
@@ -216,15 +223,97 @@ pub async fn run_pipelines(app: Arc<RuntimeApp>, config: RuntimeConfig) -> Resul
         return Err(EngineError::NoSupportedPipelines);
     }
 
-    while let Some(task) = tasks.join_next().await {
-        match task {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => return Err(error),
-            Err(error) => return Err(EngineError::TaskJoin(error.to_string())),
+    const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+
+    // Spawn a task that waits for the shutdown signal and propagates it to all channels.
+    let shutdown_channels = channels.clone();
+    let shutdown_app = Arc::clone(&app);
+    let (drain_tx, drain_rx) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(async move {
+        shutdown.await;
+        tracing::info!("shutdown signal received, draining channels");
+        for channel in &shutdown_channels {
+            if let Err(e) = channel.shutdown().await {
+                tracing::warn!(channel = %channel.name(), error = %e, "shutdown error");
+            }
         }
+        // After inbound channels stop accepting new work, flush outbound
+        // channels (Kafka producer buffers, AMQP publisher confirms, etc.).
+        // In-flight transactions still complete via the JoinSet drain below.
+        shutdown_app.shutdown_outbound_channels().await;
+        let _ = drain_tx.send(());
+    });
+
+    // Capture a store handle for the post-drain flush below.
+    let drain_store = app.store_handle();
+
+    // Wait for either all tasks to complete or the shutdown signal.
+    enum WaitResult {
+        AllCompleted,
+        TaskError(EngineError),
+        ShutdownTriggered,
     }
 
-    Ok(())
+    let wait_result = tokio::select! {
+        result = async {
+            while let Some(task) = tasks.join_next().await {
+                match task {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => return WaitResult::TaskError(error),
+                    Err(error) => return WaitResult::TaskError(EngineError::TaskJoin(error.to_string())),
+                }
+            }
+            WaitResult::AllCompleted
+        } => { result }
+        _ = drain_rx => { WaitResult::ShutdownTriggered }
+    };
+
+    match wait_result {
+        WaitResult::AllCompleted => Ok(()),
+        WaitResult::TaskError(error) => {
+            tracing::error!(error = %error, "pipeline task failed, shutting down");
+            for channel in &channels {
+                let _ = channel.shutdown().await;
+            }
+            let _ = tokio::time::timeout(DRAIN_TIMEOUT, async {
+                while let Some(task) = tasks.join_next().await {
+                    let _ = task;
+                }
+            })
+            .await;
+            Err(error)
+        }
+        WaitResult::ShutdownTriggered => {
+            tracing::info!("draining in-flight tasks");
+            let drain_result = tokio::time::timeout(DRAIN_TIMEOUT, async {
+                while let Some(task) = tasks.join_next().await {
+                    match task {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => return Err(error),
+                        Err(error) => return Err(EngineError::TaskJoin(error.to_string())),
+                    }
+                }
+                Ok(())
+            })
+            .await;
+
+            // Flush the store after in-flight tasks finish. Best-effort:
+            // a flush failure is logged but does not block exit.
+            if let Err(error) = drain_store.shutdown().await {
+                tracing::warn!(error = %error, "store shutdown error");
+            }
+            match drain_result {
+                Ok(result) => {
+                    tracing::info!("channels drained successfully");
+                    result
+                }
+                Err(_) => {
+                    tracing::warn!("drain timeout exceeded, forcing shutdown");
+                    Ok(())
+                }
+            }
+        }
+    }
 }
 
 #[cfg(any(
@@ -586,5 +675,146 @@ auth_bearer_token = "secret"
                 .map(|value| value.expose_secret())
                 == Some("secret")
         );
+    }
+
+    #[cfg(feature = "channel-http")]
+    fn pick_free_port() -> u16 {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("must bind ephemeral port");
+        listener.local_addr().expect("must read local addr").port()
+    }
+
+    #[cfg(feature = "channel-http")]
+    fn runnable_config(port: u16) -> RuntimeConfig {
+        RuntimeConfig::parse(&format!(
+            r#"
+[runtime]
+name = "engine-test"
+instance_id = "engine-test-01"
+
+[store]
+backend = "sqlite"
+url = "sqlite::memory:"
+
+[channels.http-in]
+type = "http"
+mode = "server"
+bind = "127.0.0.1:{port}"
+auth_mode = "disabled"
+allow_plaintext = true
+
+[[pipeline]]
+name = "demo"
+channel_in = "http-in"
+message_types = ["pacs.008"]
+participants = [{{ name = "message-logger" }}]
+"#
+        ))
+        .expect("config should parse")
+    }
+
+    #[cfg(feature = "channel-http")]
+    #[tokio::test]
+    async fn run_pipelines_returns_ok_when_shutdown_signals_immediately() {
+        use std::sync::Arc;
+
+        use super::run_pipelines;
+        use crate::app::RuntimeApp;
+
+        let port = pick_free_port();
+        let config = runnable_config(port);
+        let app = Arc::new(
+            RuntimeApp::from_config(&config)
+                .await
+                .expect("app should build"),
+        );
+        // Already-resolved future = signal the engine to drain on first poll.
+        let shutdown = async {};
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            run_pipelines(app, config, shutdown),
+        )
+        .await
+        .expect("engine should exit before timeout");
+        assert!(result.is_ok(), "engine returned error: {:?}", result.err());
+    }
+
+    #[cfg(feature = "channel-http")]
+    #[tokio::test]
+    async fn run_pipelines_returns_no_supported_pipelines_when_no_inbound_starts() {
+        use std::sync::Arc;
+
+        use super::{run_pipelines, EngineError};
+        use crate::app::RuntimeApp;
+
+        let port = pick_free_port();
+        let mut config = runnable_config(port);
+        let app = Arc::new(
+            RuntimeApp::from_config(&config)
+                .await
+                .expect("app should build"),
+        );
+        // After the app has built (with the real http channel), poison the
+        // config so the engine's per-pipeline match rejects every pipeline.
+        // The validate() guard runs only at parse time, so direct mutation is
+        // legal and exercises the engine's defensive `started == 0` branch.
+        if let Some(channel) = config.channels.get_mut("http-in") {
+            channel.channel_type = "nonexistent".to_string();
+        }
+        let result = run_pipelines(app, config, async {}).await;
+        assert!(matches!(result, Err(EngineError::NoSupportedPipelines)));
+    }
+
+    #[cfg(feature = "channel-http")]
+    #[tokio::test]
+    async fn shutdown_outbound_channels_invokes_outbound_shutdown_without_error() {
+        use std::sync::Arc;
+
+        use crate::app::RuntimeApp;
+
+        // Build an app whose pipeline declares an http outbound; the call
+        // must complete without panic regardless of whether the outbound is
+        // currently reachable (it is not — the URL is bogus).
+        let in_port = pick_free_port();
+        let toml = format!(
+            r#"
+[runtime]
+name = "engine-test"
+instance_id = "engine-test-02"
+
+[store]
+backend = "sqlite"
+url = "sqlite::memory:"
+
+[channels.http-in]
+type = "http"
+mode = "server"
+bind = "127.0.0.1:{in_port}"
+auth_mode = "disabled"
+allow_plaintext = true
+
+[channels.http-out]
+type = "http"
+mode = "client"
+endpoint = "http://127.0.0.1:1/never-listened"
+auth_mode = "disabled"
+allow_plaintext = true
+
+[[pipeline]]
+name = "demo"
+channel_in = "http-in"
+channel_out = "http-out"
+message_types = ["pacs.008"]
+participants = [{{ name = "message-logger" }}]
+"#
+        );
+        let config = RuntimeConfig::parse(&toml).expect("config should parse");
+        let app = Arc::new(
+            RuntimeApp::from_config(&config)
+                .await
+                .expect("app should build"),
+        );
+        // Direct call — must complete cleanly.
+        app.shutdown_outbound_channels().await;
     }
 }

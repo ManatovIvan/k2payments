@@ -452,6 +452,15 @@ impl Store for RocksDbStore {
         })
         .await
     }
+
+    async fn shutdown(&self) -> Result<(), StoreError> {
+        let db = Arc::clone(&self.db);
+        run_blocking(move || {
+            db.flush()
+                .map_err(|e| StoreError::new(format!("rocksdb flush failed: {e}")))
+        })
+        .await
+    }
 }
 
 async fn find_by_key_field(

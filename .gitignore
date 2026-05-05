@@ -22,3 +22,15 @@ Thumbs.db
 # Temporary files
 *.tmp
 *.bak
+
+# SDD agent context database WAL sidecars (the .db itself is committed)
+docs/agent_context.db-shm
+docs/agent_context.db-wal
+
+# SDD CLI scratch/derived state — DB is the source of truth
+.sdd-iter
+.sdd-coverage-ledger.json
+docs/agent_context_schema.sql
+
+# Claude Code local-only settings (per-user permission overrides)
+.claude/settings.local.json

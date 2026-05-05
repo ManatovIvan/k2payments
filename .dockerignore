@@ -1,0 +1,35 @@
+# Build artifacts
+target/
+
+# Version control
+.git/
+.gitignore
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Documentation (not needed in build)
+docs/
+*.md
+LICENSE
+CODE_OF_CONDUCT.md
+
+# Dev tooling
+.devcontainer/
+.github/
+
+# Environment files
+.env
+.env.*
+
+# Temporary files
+*.tmp
+*.bak
+*.log
