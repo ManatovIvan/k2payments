@@ -15,3 +15,7 @@ wildcards = "allow"
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
+
+# The mx20022 library is consumed as a git dependency from our own repo.
+[sources.allow-org]
+github = ["ManatovIvan"]

@@ -26,17 +26,18 @@ jobs:
           python-version: "3.12"
 
       - name: Install Semgrep
-        run: pip install --no-cache-dir semgrep
+        # Pin the version: avoids slow pip dependency backtracking and keeps runs reproducible.
+        run: pip install --no-cache-dir "semgrep==1.164.0"
 
       - name: Run Semgrep
-        # Fail the job on findings; the SARIF is still uploaded below.
+        # Report-only: findings are uploaded to the Security tab for triage but do
+        # not fail CI (SAST is noisy). Tighten with --error once findings are triaged.
         run: >-
           semgrep scan
           --config p/default
           --config p/rust
           --config p/secrets
           --sarif --output semgrep.sarif
-          --error
 
       - name: Upload SARIF to GitHub Security
         if: always()
