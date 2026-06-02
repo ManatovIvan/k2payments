@@ -47,9 +47,9 @@ sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-r
 tonic = { version = "0.12", features = ["transport", "tls"] }
 prost = "0.13"
 prost-types = "0.13"
-mx20022-parse = "0.1.1"
-mx20022-validate = "0.1.1"
-mx20022-model = "0.1.1"
+mx20022-parse = { git = "https://github.com/ManatovIvan/mx20022.git", branch = "main" }
+mx20022-validate = { git = "https://github.com/ManatovIvan/mx20022.git", branch = "main" }
+mx20022-model = { git = "https://github.com/ManatovIvan/mx20022.git", branch = "main" }
 subtle = "2.5"
 secrecy = { version = "0.10", features = ["serde"] }
 

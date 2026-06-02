@@ -1,0 +1,47 @@
+name: Semgrep
+
+on:
+  push:
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "27 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  semgrep:
+    name: Semgrep SAST
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Semgrep
+        # Pin the version: avoids slow pip dependency backtracking and keeps runs reproducible.
+        run: pip install --no-cache-dir "semgrep==1.164.0"
+
+      - name: Run Semgrep
+        # Report-only: findings are uploaded to the Security tab for triage but do
+        # not fail CI (SAST is noisy). Tighten with --error once findings are triaged.
+        run: >-
+          semgrep scan
+          --config p/default
+          --config p/rust
+          --config p/secrets
+          --sarif --output semgrep.sarif
+
+      - name: Upload SARIF to GitHub Security
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
