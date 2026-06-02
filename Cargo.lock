@@ -2332,18 +2332,16 @@ dependencies = [
 
 [[package]]
 name = "mx20022-model"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9f0d492a0adb26c3fe19f5c99b6c9c2eea5adaa200df32931acf03d6b1d507b1"
+version = "0.3.0"
+source = "git+https://github.com/ManatovIvan/mx20022.git?branch=main#832a9b26ae0b0b88eb0add47b46a91201806b392"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "mx20022-parse"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "044a05966a2fda216586111210e285192e4d85a2479c36fb49bcb8f2fd95b848"
+version = "0.3.0"
+source = "git+https://github.com/ManatovIvan/mx20022.git?branch=main#832a9b26ae0b0b88eb0add47b46a91201806b392"
 dependencies = [
  "mx20022-model",
  "quick-xml",
@@ -2470,9 +2468,8 @@ dependencies = [
 
 [[package]]
 name = "mx20022-validate"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4e3a47c28673aa6f0c162236410f0c7cb820a3da5fc117ef4ac3b6ac6904633c"
+version = "0.3.0"
+source = "git+https://github.com/ManatovIvan/mx20022.git?branch=main#832a9b26ae0b0b88eb0add47b46a91201806b392"
 dependencies = [
  "mx20022-model",
  "regex",
@@ -3101,9 +3098,9 @@ checksum = "95067976aca6421a523e491fce939a3e65249bac4b977adee0ee9771568e8aa3"
 
 [[package]]
 name = "quick-xml"
-version = "0.37.5"
+version = "0.39.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "331e97a1af0bf59823e6eadffe373d7b27f485be8748f71471c662c1f269b7fb"
+checksum = "cdcc8dd4e2f670d309a5f0e83fe36dfdc05af317008fea29144da1a2ac858e5e"
 dependencies = [
  "memchr",
  "serde",
