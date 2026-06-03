@@ -1,0 +1,20 @@
+[package]
+name = "mx20022-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "mx20022-web"
+path = "src/main.rs"
+
+[dependencies]
+mx20022-parse = { workspace = true }
+mx20022-translate = { workspace = true }
+mx20022-model = { workspace = true, features = ["all"] }
+axum = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
