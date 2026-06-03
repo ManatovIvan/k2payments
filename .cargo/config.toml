@@ -1,0 +1,6 @@
+# Fetch git dependencies via the system `git` CLI instead of cargo's built-in
+# libgit2. The built-in fetcher fails behind some corporate HTTP(S) proxies with
+# `invalid version 0 on git_proxy_options`; the system git honours the proxy and
+# credentials already configured on the machine.
+[net]
+git-fetch-with-cli = true
