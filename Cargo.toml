@@ -23,6 +23,7 @@ members = [
   "crates/mx20022-crypto",
   "crates/mx20022-cli",
   "crates/mx20022-runtime",
+  "crates/mx20022-web",
 ]
 
 [workspace.package]
@@ -50,6 +51,7 @@ prost-types = "0.13"
 mx20022-parse = { git = "https://github.com/ManatovIvan/mx20022.git", branch = "main" }
 mx20022-validate = { git = "https://github.com/ManatovIvan/mx20022.git", branch = "main" }
 mx20022-model = { git = "https://github.com/ManatovIvan/mx20022.git", branch = "main" }
+mx20022-translate = { git = "https://github.com/ManatovIvan/mx20022.git", branch = "main" }
 subtle = "2.5"
 secrecy = { version = "0.10", features = ["serde"] }
 
